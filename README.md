@@ -83,6 +83,16 @@ Toolchain smoke test:
 docker build -t tgapi . && docker run --rm tgapi ./smoke
 ```
 
+## Development
+
+Unit tests link libtdjson (CGO), so they run inside the build image rather than
+on the host:
+
+```sh
+./scripts/test.sh          # go test ./... in the toolchain image
+./scripts/footprint.sh     # measure per-account memory / disk of a running stack
+```
+
 ## API
 
 Every request except `GET /healthz` must carry `Authorization: Bearer <token>`.
