@@ -150,3 +150,8 @@ docker compose up -d --scale worker=4
 Minimum one worker. Killing a worker (graceful or hard) fails its sessions over
 to peers within seconds. All replicas share the `tdlibdata` volume, so this
 assumes a single host; spreading across hosts would need shared storage.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Contributions welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
