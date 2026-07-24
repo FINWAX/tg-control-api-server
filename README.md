@@ -39,8 +39,9 @@ Supporting pieces: **Postgres** is the registry and ownership lease (apps,
 proxies, sessions, workers, webhook deliveries, API tokens). Secrets
 (api_hash, bot tokens, proxy passwords, session DB keys) are encrypted with
 AES-256-GCM using a master key from the environment and never leave the service
-in plaintext. Each account gets its own TDLib database directory, and a per-session
-proxy is mandatory by design.
+in plaintext. Each account gets its own TDLib database directory, and each session
+can run through its own dedicated proxy (optional, but supported per session so up
+to ~50 accounts can each present from a distinct IP).
 
 ```
 client ──HTTP──> gateway ──reverse-proxy──> worker ──CGO──> libtdjson ──> Telegram
@@ -74,6 +75,11 @@ cp .env.example .env
 (api_id/api_hash, bot tokens, phones, proxies) are **never** put in env — they
 are sent to the API and stored encrypted in Postgres.
 
+Postgres credentials are read from `POSTGRES_USER` / `POSTGRES_PASSWORD` /
+`POSTGRES_DB` (dev-only defaults apply when unset); the `DATABASE_URL` the
+services use is composed from them. Set them in `.env` for anything but local
+development.
+
 ## Running
 
 ```sh
@@ -97,6 +103,29 @@ Toolchain smoke test:
 ```sh
 docker build -t tg-control-api-server . && docker run --rm tg-control-api-server ./smoke
 ```
+
+The gateway and workers expose a `/healthz` liveness endpoint and ship with
+Compose healthchecks, so `docker compose ps` reflects real readiness and the
+console only starts once the gateway is healthy.
+
+## Data and upgrades
+
+State lives in two named volumes: `pgdata` (the Postgres registry — apps,
+proxies, sessions, tokens, encrypted secrets) and `tdlibdata` (per-account TDLib
+databases). Both persist across `up`/`down` and image rebuilds; `down -v` wipes
+them.
+
+The database schema is **versioned and migrated automatically** on startup:
+each release applies only the migrations newer than what the database already
+has, in order, once each (tracked in `schema_migration`, serialized across
+gateway/workers by an advisory lock). Migrations are forward-only and additive,
+so upgrading to a newer image never drops or rewrites existing data — just
+`docker compose pull && docker compose up -d`.
+
+For host-path **portability** (move a deployment by copying a directory rather
+than exporting Docker volumes), bind-mount the volumes to host paths via a
+`compose.override.yml` — see the comment at the bottom of
+[docker-compose.yml](docker-compose.yml).
 
 ## Development
 
@@ -124,6 +153,8 @@ Every request except `GET /healthz` must carry `Authorization: Bearer <token>`.
 | `POST /v1/user/{id}/login/password` `{password}` | Submit the 2FA password |
 | `POST /v1/{user\|bot}/{id}/call` `{method, params}` | Async td_api call on the session |
 | `POST /v1/execute` `{method, params}` | Synchronous td_api call (no session) |
+| `POST /v1/files?name=` | Upload a file → `{path}` (single-shot; see [Sending files](#sending-files)) |
+| `PATCH/GET /v1/files/{id}`, `POST /v1/files/{id}/complete`, `DELETE /v1/files/{id}` | Resumable/chunked upload |
 | `PUT/DELETE /v1/{user\|bot}/{id}/updates/webhook` | Manage update delivery |
 | `GET  /v1/{user\|bot}/{id}` | Session status |
 | `PATCH /v1/{user\|bot}/{id}` `{label?, proxy_id?}` | Rename / change proxy (applied live) |
@@ -134,6 +165,53 @@ Every request except `GET /healthz` must carry `Authorization: Bearer <token>`.
 
 Responses use an envelope: `{"ok": true, "result": ...}` or
 `{"ok": false, "error": {"message": ...}}`.
+
+## Sending files
+
+TDLib sends media from a **file on the owning worker's disk** (`inputFileLocal`),
+never as bytes inline in a `/call`. To make that work as a pure HTTP API, upload
+the file first: the gateway writes it to a volume shared with the workers, and
+the owning worker reads it back locally — so the bytes cross the network once
+(client → gateway), not again to the worker.
+
+**Small/medium files — single-shot:**
+
+```sh
+curl -sX POST "$G/v1/files?name=pic.jpg" -H "Authorization: Bearer $TOKEN" \
+     --data-binary @pic.jpg
+# -> { "ok": true, "result": { "path": "/uploads/<id>/pic.jpg", "size": 12345 } }
+```
+
+Then reference the returned `path`:
+
+```sh
+curl -sX POST "$G/v1/bot/$SID/call" -H "Authorization: Bearer $TOKEN" -d '{
+  "method": "sendMessage",
+  "params": { "chat_id": "@my_channel", "input_message_content": {
+    "@type": "inputMessagePhoto",
+    "photo": { "@type": "inputFileLocal", "path": "/uploads/<id>/pic.jpg" }
+  }}}'
+```
+
+**Large files (up to 2 GiB) — resumable/chunked** (survives network drops):
+
+1. `POST /v1/files?name=movie.mp4` with header `Upload-Length: <bytes>` → `{upload_id, chunk_size}`
+2. `PATCH /v1/files/<upload_id>` with header `Upload-Offset: <n>` and a chunk body, repeatedly
+3. `GET /v1/files/<upload_id>` → `{offset}` to resume after an interruption
+4. `POST /v1/files/<upload_id>/complete` → `{path}` (verifies the full length)
+
+**By URL (no upload):** pass `{"@type":"inputFileRemote","id":"https://…"}` as the
+file and TDLib fetches it directly.
+
+Uploaded files are single-use: reuse the same media across chats via the Telegram
+`remote` file id returned in the first send (`inputFileRemote`), not the local
+file. A file is removed as soon as its send completes; anything never sent is
+swept after `UPLOAD_TTL` (default 2h). `inputFileLocal` paths are confined to the
+uploads volume — a `/call` cannot reference any other path on the worker.
+
+Filenames keep their real name (the upload id lives in the directory, not the
+filename), capped at the filesystem's 255-byte limit; Telegram truncates long
+document names on its side.
 
 ## API tokens
 

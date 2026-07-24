@@ -80,6 +80,66 @@ func TestFloodWaitSeconds(t *testing.T) {
 	}
 }
 
+func TestCollectLocalFilePaths(t *testing.T) {
+	// nested inputFileLocal in a sendMessage photo + a thumbnail
+	params := json.RawMessage(`{
+		"chat_id": 1,
+		"input_message_content": {
+			"@type": "inputMessagePhoto",
+			"photo": {"@type": "inputFileLocal", "path": "/uploads/a/pic.jpg"},
+			"thumbnail": {"thumbnail": {"@type": "inputFileLocal", "path": "/uploads/b/thumb.jpg"}}
+		}
+	}`)
+	got := collectLocalFilePaths(params)
+	if len(got) != 2 {
+		t.Fatalf("collected %v, want 2 paths", got)
+	}
+	// a remote file / no local path -> nothing
+	if p := collectLocalFilePaths(json.RawMessage(`{"photo":{"@type":"inputFileRemote","id":"http://x"}}`)); len(p) != 0 {
+		t.Fatalf("remote file should yield no local paths, got %v", p)
+	}
+}
+
+func TestGuardLocalPaths(t *testing.T) {
+	m := &Manager{uploadsDir: "/uploads"}
+
+	// inside the volume: allowed, dedup to one dir
+	dirs, err := m.guardLocalPaths(json.RawMessage(
+		`{"a":{"@type":"inputFileLocal","path":"/uploads/x/one.jpg"},` +
+			`"b":{"@type":"inputFileLocal","path":"/uploads/x/two.jpg"}}`))
+	if err != nil {
+		t.Fatalf("guard inside volume: %v", err)
+	}
+	if len(dirs) != 1 || dirs[0] != "/uploads/x" {
+		t.Fatalf("dirs = %v, want [/uploads/x]", dirs)
+	}
+
+	// escaping the volume: denied
+	for _, p := range []string{"/etc/passwd", "/uploads/../etc/passwd", "/data/secret"} {
+		if _, err := m.guardLocalPaths(json.RawMessage(
+			`{"f":{"@type":"inputFileLocal","path":"` + p + `"}}`)); !errors.Is(err, ErrLocalPathDenied) {
+			t.Errorf("guard(%q) err = %v, want ErrLocalPathDenied", p, err)
+		}
+	}
+
+	// no local file: no dirs, no error
+	if dirs, err := m.guardLocalPaths(json.RawMessage(`{"chat_id":1}`)); err != nil || dirs != nil {
+		t.Fatalf("guard no-file = (%v, %v)", dirs, err)
+	}
+}
+
+func TestExtractMessageIDs(t *testing.T) {
+	if ids := extractMessageIDs(json.RawMessage(`{"@type":"message","id":42}`)); len(ids) != 1 || ids[0] != 42 {
+		t.Fatalf("single message ids = %v", ids)
+	}
+	if ids := extractMessageIDs(json.RawMessage(`{"@type":"messages","messages":[{"id":1},{"id":2}]}`)); len(ids) != 2 {
+		t.Fatalf("album ids = %v, want 2", ids)
+	}
+	if ids := extractMessageIDs(json.RawMessage(`{"@type":"ok"}`)); len(ids) != 0 {
+		t.Fatalf("non-message ids = %v, want none", ids)
+	}
+}
+
 func TestStringChatID(t *testing.T) {
 	cases := []struct {
 		in   string

@@ -24,6 +24,7 @@ import (
 	"github.com/FINWAX/tg-control-api-server/internal/secret"
 	"github.com/FINWAX/tg-control-api-server/internal/store"
 	"github.com/FINWAX/tg-control-api-server/internal/tdjson"
+	"github.com/FINWAX/tg-control-api-server/internal/upload"
 )
 
 // liveSession is the in-process state of one account.
@@ -50,6 +51,12 @@ func (m *Manager) updateHandler(ls *liveSession) client.ResultHandler {
 	return client.NewCallbackResultHandler(func(result client.Type) {
 		if result.GetType() != client.TypeUpdate {
 			return
+		}
+		// A send that referenced an uploaded file is done once TDLib confirms it:
+		// drop the local upload immediately (success or failure), independent of
+		// any webhook subscription.
+		if ctor := result.GetConstructor(); ctor == "updateMessageSendSucceeded" || ctor == "updateMessageSendFailed" {
+			m.finishUpload(result)
 		}
 		ls.mu.Lock()
 		on := ls.hasWH
@@ -129,11 +136,18 @@ type Manager struct {
 
 	outbox chan outItem
 
+	uploadsDir string        // shared uploads volume; inputFileLocal is confined here
+	uploads    *upload.Store // same volume, used only for the TTL sweep
+	uploadTTL  time.Duration // abandoned/sent uploads older than this are swept
+
 	stopping atomic.Bool // set on graceful shutdown; heartbeat/reconciler stand down
 
 	mu    sync.RWMutex
 	live  map[string]*liveSession
 	retry map[string]time.Time // session id -> earliest next open attempt (backoff)
+
+	pendMu  sync.Mutex
+	pending map[int64][]string // temp message id -> upload dirs to delete once sent
 }
 
 // worker coordination cadence.
@@ -154,13 +168,17 @@ const (
 	maxFloodRetries     = 2 // max transparent flood-wait retries per call
 )
 
-func NewManager(st *store.Store, sec *secret.Box, dataDir, workerID, selfAddr string, capacity int) *Manager {
+func NewManager(st *store.Store, sec *secret.Box, dataDir, workerID, selfAddr string, capacity int, uploadsDir string, uploadTTL time.Duration) *Manager {
 	m := &Manager{
 		st: st, sec: sec, dataDir: dataDir,
 		workerID: workerID, selfAddr: selfAddr, capacity: capacity,
-		outbox: make(chan outItem, 1024),
-		live:   map[string]*liveSession{},
-		retry:  map[string]time.Time{},
+		uploadsDir: uploadsDir,
+		uploads:    upload.New(uploadsDir, 0, 0, 0), // sizes irrelevant: workers only sweep
+		uploadTTL:  uploadTTL,
+		outbox:     make(chan outItem, 1024),
+		live:       map[string]*liveSession{},
+		retry:      map[string]time.Time{},
+		pending:    map[int64][]string{},
 	}
 	// Register synchronously so the first reconcile already counts this worker.
 	_ = st.RegisterWorker(context.Background(), workerID, selfAddr)
@@ -776,7 +794,14 @@ func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMe
 		return nil, fmt.Errorf("session is %s, not authorized", ls.status_())
 	}
 
-	params, err := m.resolveChatUsername(ctx, cl, params)
+	// Confine any inputFileLocal to the uploads volume, and note which upload
+	// dirs this call references so they can be dropped once the send completes.
+	uploadDirs, err := m.guardLocalPaths(params)
+	if err != nil {
+		return nil, err
+	}
+
+	params, err = m.resolveChatUsername(ctx, cl, params)
 	if err != nil {
 		return nil, err
 	}
@@ -789,6 +814,9 @@ func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMe
 				res, err = m.sendWithFloodRetry(ctx, cl, method, params)
 			}
 		}
+	}
+	if err == nil && len(uploadDirs) > 0 {
+		m.trackUpload(res, uploadDirs)
 	}
 	return res, err
 }

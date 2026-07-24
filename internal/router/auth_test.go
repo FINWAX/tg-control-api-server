@@ -40,3 +40,19 @@ func TestSessionTarget(t *testing.T) {
 		}
 	}
 }
+
+// TestIsFilesPath locks the file-upload routes an enabled scoped token may use.
+func TestIsFilesPath(t *testing.T) {
+	yes := []string{"/v1/files", "/v1/files/abc123", "/v1/files/abc123/complete"}
+	no := []string{"/v1/file", "/v1/filesx", "/v1/sessions", "/v1/tokens", "/healthz"}
+	for _, p := range yes {
+		if !isFilesPath(p) {
+			t.Errorf("isFilesPath(%q) = false, want true", p)
+		}
+	}
+	for _, p := range no {
+		if isFilesPath(p) {
+			t.Errorf("isFilesPath(%q) = true, want false", p)
+		}
+	}
+}

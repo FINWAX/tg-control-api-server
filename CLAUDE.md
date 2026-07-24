@@ -50,14 +50,22 @@ API и шифруются в БД; в .env только инфра-конфиг 
 - `POST /v1/user/{id}/login/code` {code}; `.../login/password` {password}
 - `POST /v1/{user|bot}/{id}/call` {method, params} -> async td_api
 - `POST /v1/execute` {method, params} -> синхронный td_api (без сессии)
+- `POST /v1/files?name=` -> {path} (single-shot); `PATCH/GET /v1/files/{id}`,
+  `POST /v1/files/{id}/complete`, `DELETE /v1/files/{id}` (resumable). Файл для
+  отправки медиа через inputFileLocal; общий том, чистка событийно + по TTL.
 - `GET /v1/{user|bot}/{id}` -> статус
+
+Прокси на сессию поддерживается (addProxy), в локальном случае опционален; смысл -
+чтобы каждый из <50 аккаунтов мог ходить со своего IP. Схема БД версионируется
+миграциями (internal/store/migrations.go), апгрейд не рушит данные.
 
 Пинованные версии (НЕ расходить): go-tdlib v1.0.0-beta1 <-> образ
 ghcr.io/zelenin/tdlib-docker:b498497-alpine (TDLib b498497).
 
 Структура: cmd/gateway (HTTP); internal/api, internal/session (воркер+
 authorizer), internal/store (Postgres), internal/secret (AES-GCM),
-internal/tdjson (raw JSON-диспетч); cmd/smoke (тулчейн).
+internal/upload (файлы для медиа), internal/tdjson (raw JSON-диспетч);
+cmd/smoke (тулчейн).
 
 ## Git
 Репозиторий создаётся при начале разработки по решению пользователя.

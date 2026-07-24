@@ -101,7 +101,13 @@ func httpStatusForTd(code int) int {
 	}
 }
 
+// maxBodyBytes caps a request body so an oversized payload can't exhaust memory
+// during JSON decode. Generous enough for any td_api /call params (including
+// inline file data), while still bounding worst case.
+const maxBodyBytes = 8 << 20 // 8 MiB
+
 func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return false
@@ -297,6 +303,10 @@ func (s *Server) handleCall(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.mgr.Call(r.Context(), r.PathValue("id"), req.Method, req.Params)
 	if err != nil {
+		if errors.Is(err, session.ErrLocalPathDenied) {
+			writeErr(w, http.StatusForbidden, err.Error())
+			return
+		}
 		writeCallErr(w, err)
 		return
 	}

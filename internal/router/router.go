@@ -21,20 +21,23 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/FINWAX/tg-control-api-server/internal/store"
+	"github.com/FINWAX/tg-control-api-server/internal/upload"
 )
 
 type Router struct {
 	st        *store.Store
 	stale     time.Duration
 	master    string // the env master token: full admin access
+	uploads   *upload.Store
 	transport http.RoundTripper
 }
 
-func New(st *store.Store, stale time.Duration, token string) http.Handler {
+func New(st *store.Store, stale time.Duration, token string, uploads *upload.Store) http.Handler {
 	rt := &Router{
-		st:     st,
-		stale:  stale,
-		master: token,
+		st:      st,
+		stale:   stale,
+		master:  token,
+		uploads: uploads,
 		// otelhttp.NewTransport adds client spans and injects the traceparent
 		// header, so a request's trace continues into the owning worker.
 		transport: otelhttp.NewTransport(&http.Transport{
@@ -62,6 +65,11 @@ func New(st *store.Store, stale time.Duration, token string) http.Handler {
 	// Registry writes served directly by the gateway (rename only; ids immutable).
 	mux.HandleFunc("PATCH /v1/apps/{id}", rt.updateApp)
 	mux.HandleFunc("PATCH /v1/proxies/{id}", rt.updateProxy)
+
+	// File uploads onto the shared volume (single-shot + resumable). Allowed for
+	// any enabled token; the send-time path guard + per-session scope enforce
+	// what may actually be sent.
+	rt.registerFileRoutes(mux)
 
 	// Scoped API token management (master only, enforced in auth).
 	mux.HandleFunc("GET /v1/tokens", rt.listTokens)
@@ -132,6 +140,13 @@ func (rt *Router) auth(next http.Handler) http.Handler {
 		}
 		if !enabled {
 			writeErr(w, http.StatusForbidden, "token is disabled")
+			return
+		}
+		// Uploading bytes to the shared volume isn't session-scoped; any enabled
+		// token may do it. The file only becomes sendable through a session's
+		// /call, which the path guard + token scope still gate.
+		if isFilesPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
 			return
 		}
 		sid, ok := sessionTarget(r.Method, r.URL.Path)
@@ -426,12 +441,18 @@ func (rt *Router) forward(w http.ResponseWriter, r *http.Request, base string) {
 	p.ServeHTTP(w, r)
 }
 
+// maxBodyBytes caps management request bodies (labels, token grants) — all
+// small — so an oversized payload can't exhaust memory during decode. Session
+// /call bodies are streamed to the worker, which enforces its own larger cap.
+const maxBodyBytes = 1 << 20 // 1 MiB
+
 // decodeJSON reads a JSON body into dst, writing a 400 and returning false on
 // malformed input. An empty body is treated as an empty object (partial updates).
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if r.Body == nil || r.ContentLength == 0 {
 		return true
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return false

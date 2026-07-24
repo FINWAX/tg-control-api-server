@@ -33,6 +33,8 @@ func main() {
 	dataDir := envOr("DATA_DIR", "/data")
 	addr := envOr("LISTEN_ADDR", ":8080")
 	capacity := envInt("WORKER_CAPACITY", 200)
+	uploadsDir := envOr("UPLOADS_DIR", "/uploads")
+	uploadTTL := envDur("UPLOAD_TTL", 2*time.Hour)
 
 	shutdownObs, err := obs.Setup(context.Background(), "tg-control-api-server-worker")
 	if err != nil {
@@ -55,7 +57,7 @@ func main() {
 	workerID := envOr("WORKER_ID", hostname())
 	selfAddr := envOr("WORKER_ADVERTISE", "http://"+advertiseIP()+addr)
 
-	mgr := session.NewManager(st, sec, dataDir, workerID, selfAddr, capacity)
+	mgr := session.NewManager(st, sec, dataDir, workerID, selfAddr, capacity, uploadsDir, uploadTTL)
 	httpSrv := &http.Server{Addr: addr, Handler: otelhttp.NewHandler(api.NewServer(st, sec, mgr), "worker")}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -117,6 +119,15 @@ func envInt(k string, def int) int {
 	if v := os.Getenv(k); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+func envDur(k string, def time.Duration) time.Duration {
+	if v := os.Getenv(k); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
 		}
 	}
 	return def

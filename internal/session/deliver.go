@@ -59,6 +59,7 @@ func (m *Manager) purgeOnce() {
 	} else if w > 0 {
 		log.Printf("retention: purged %d dead workers", w)
 	}
+	m.sweepUploads()
 }
 
 // runOutboxWriter drains the in-memory queue into webhook_delivery.

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/FINWAX/tg-control-api-server/internal/obs"
 	"github.com/FINWAX/tg-control-api-server/internal/router"
 	"github.com/FINWAX/tg-control-api-server/internal/store"
+	"github.com/FINWAX/tg-control-api-server/internal/upload"
 )
 
 func main() {
@@ -38,9 +40,18 @@ func main() {
 	}
 	defer st.Close()
 
+	// Shared uploads volume, mounted read-write here and on the workers that
+	// read the files back via inputFileLocal.
+	uploads := upload.New(
+		envOr("UPLOADS_DIR", "/uploads"),
+		envInt64("MAX_SINGLE_SHOT_BYTES", 64<<20), // 64 MiB single-shot
+		envInt64("MAX_CHUNK_BYTES", 16<<20),       // 16 MiB per resumable chunk
+		envInt64("MAX_UPLOAD_BYTES", 2<<30),       // 2 GiB total (Telegram's ceiling)
+	)
+
 	// A worker is routable while its heartbeat is within this window (matches
 	// the worker's own staleness threshold).
-	srv := router.New(st, 30*time.Second, token)
+	srv := router.New(st, 30*time.Second, token, uploads)
 	httpSrv := &http.Server{Addr: addr, Handler: otelhttp.NewHandler(srv, "gateway")}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -72,6 +83,15 @@ func mustEnv(k string) string {
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
+	}
+	return def
+}
+
+func envInt64(k string, def int64) int64 {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
 	}
 	return def
 }

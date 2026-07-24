@@ -2,13 +2,15 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: tgapi
-      POSTGRES_PASSWORD: tgapi
-      POSTGRES_DB: tgapi
+      # Credentials come from the environment (.env) with dev-only defaults, so
+      # nothing sensitive is hardcoded here. Override POSTGRES_* in .env for prod.
+      POSTGRES_USER: ${POSTGRES_USER:-tgapi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tgapi}
+      POSTGRES_DB: ${POSTGRES_DB:-tgapi}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U tgapi"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-tgapi} -d $${POSTGRES_DB:-tgapi}"]
       interval: 3s
       timeout: 3s
       retries: 15
@@ -22,11 +24,22 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://tgapi:tgapi@postgres:5432/tgapi?sslmode=disable
+      DATABASE_URL: postgres://${POSTGRES_USER:-tgapi}:${POSTGRES_PASSWORD:-tgapi}@postgres:5432/${POSTGRES_DB:-tgapi}?sslmode=disable
       API_TOKEN: ${API_TOKEN}
       LISTEN_ADDR: ":8080"
+      UPLOADS_DIR: /uploads
+    volumes:
+      # Shared with the workers: the gateway writes uploaded files here, the
+      # owning worker reads them back via inputFileLocal (no worker relay).
+      - uploads:/uploads
     ports:
       - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
 
   worker:
     build: .
@@ -37,16 +50,25 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://tgapi:tgapi@postgres:5432/tgapi?sslmode=disable
+      DATABASE_URL: postgres://${POSTGRES_USER:-tgapi}:${POSTGRES_PASSWORD:-tgapi}@postgres:5432/${POSTGRES_DB:-tgapi}?sslmode=disable
       MASTER_KEY: ${MASTER_KEY}
       DATA_DIR: /data
       LISTEN_ADDR: ":8080"
       WORKER_CAPACITY: "200"
+      UPLOADS_DIR: /uploads
+      UPLOAD_TTL: 2h
     volumes:
       - tdlibdata:/data
+      - uploads:/uploads
     stop_grace_period: 30s
     deploy:
       replicas: 2
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
 
   # Optional management console: Next.js static export served by Caddy, which
   # also reverse-proxies /v1 and /healthz to the gateway (single origin, no
@@ -56,13 +78,19 @@ services:
     image: tg-control-api-server-ui:local
     restart: unless-stopped
     depends_on:
-      - gateway
+      gateway:
+        condition: service_healthy
     environment:
       GATEWAY_UPSTREAM: gateway:8080
     ports:
       - "3080:80"
     profiles: ["ui"]
 
+# Named volumes keep data across `up`/`down` and rebuilds. For host-path
+# portability (move the deployment by copying a directory), bind-mount instead:
+# override pgdata/tdlibdata in a compose.override.yml, e.g.
+#   volumes: { pgdata: { driver_opts: { type: none, o: bind, device: /srv/tgc/pg } } }
 volumes:
   pgdata:
   tdlibdata:
+  uploads:
