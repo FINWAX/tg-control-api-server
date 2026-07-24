@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"github.com/zelenin/go-tdlib/client"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/FINWAX/tg-control-api-server/internal/api"
+	"github.com/FINWAX/tg-control-api-server/internal/obs"
 	"github.com/FINWAX/tg-control-api-server/internal/secret"
 	"github.com/FINWAX/tg-control-api-server/internal/session"
 	"github.com/FINWAX/tg-control-api-server/internal/store"
@@ -31,6 +33,11 @@ func main() {
 	dataDir := envOr("DATA_DIR", "/data")
 	addr := envOr("LISTEN_ADDR", ":8080")
 	capacity := envInt("WORKER_CAPACITY", 200)
+
+	shutdownObs, err := obs.Setup(context.Background(), "tg-control-api-server-worker")
+	if err != nil {
+		log.Fatalf("obs: %v", err)
+	}
 
 	sec, err := secret.New(masterKey)
 	if err != nil {
@@ -49,7 +56,7 @@ func main() {
 	selfAddr := envOr("WORKER_ADVERTISE", "http://"+advertiseIP()+addr)
 
 	mgr := session.NewManager(st, sec, dataDir, workerID, selfAddr, capacity)
-	httpSrv := &http.Server{Addr: addr, Handler: api.NewServer(st, sec, mgr)}
+	httpSrv := &http.Server{Addr: addr, Handler: otelhttp.NewHandler(api.NewServer(st, sec, mgr), "worker")}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -69,6 +76,7 @@ func main() {
 	defer cancel()
 	_ = httpSrv.Shutdown(shCtx) // stop accepting, drain in-flight requests
 	mgr.Shutdown(shCtx)         // hand sessions to peers, close clients, deregister
+	_ = shutdownObs(shCtx)      // flush telemetry
 }
 
 // advertiseIP returns this container's routable IP on the compose network. It

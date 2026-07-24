@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/FINWAX/tg-control-api-server/internal/store"
 )
 
@@ -25,7 +27,7 @@ type Router struct {
 	st        *store.Store
 	stale     time.Duration
 	master    string // the env master token: full admin access
-	transport *http.Transport
+	transport http.RoundTripper
 }
 
 func New(st *store.Store, stale time.Duration, token string) http.Handler {
@@ -33,13 +35,15 @@ func New(st *store.Store, stale time.Duration, token string) http.Handler {
 		st:     st,
 		stale:  stale,
 		master: token,
-		transport: &http.Transport{
+		// otelhttp.NewTransport adds client spans and injects the traceparent
+		// header, so a request's trace continues into the owning worker.
+		transport: otelhttp.NewTransport(&http.Transport{
 			DialContext:         (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
 			MaxIdleConns:        100,
 			IdleConnTimeout:     90 * time.Second,
 			TLSHandshakeTimeout: 5 * time.Second,
 			// No response-header/overall timeout: login and media can be slow.
-		},
+		}),
 	}
 
 	mux := http.NewServeMux()

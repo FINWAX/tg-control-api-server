@@ -151,6 +151,21 @@ Minimum one worker. Killing a worker (graceful or hard) fails its sessions over
 to peers within seconds. All replicas share the `tdlibdata` volume, so this
 assumes a single host; spreading across hosts would need shared storage.
 
+## Observability
+
+OpenTelemetry is built in and opt-in. Set `OTEL_EXPORTER_OTLP_ENDPOINT` (plus any
+standard `OTEL_*` variables) on the gateway and workers to export **traces,
+metrics, and logs** over OTLP to any collector:
+
+- **Traces** span each request end to end, from the gateway into the owning
+  worker (context is propagated on the reverse-proxy hop).
+- **Metrics** are HTTP server/client metrics from `otelhttp`.
+- **Logs** — every `log` line is teed to OTLP while still printing to stdout
+  (Docker logs), so nothing is lost.
+
+With no endpoint configured, telemetry is disabled and the service just logs to
+stdout.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
