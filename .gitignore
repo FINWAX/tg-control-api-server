@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+.tdlib/
+/gateway
+/smoke
+/worker
+
+# UI build artifacts (built inside the container)
+ui/node_modules/
+ui/.next/
+ui/out/

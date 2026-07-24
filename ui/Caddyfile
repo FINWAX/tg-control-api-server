@@ -1,0 +1,22 @@
+{
+	admin off
+	auto_https off
+}
+
+:80 {
+	encode gzip
+
+	# API and health are reverse-proxied to the gateway, so the browser talks to
+	# a single origin (no CORS). The gateway still enforces the bearer token.
+	@api path /v1/* /healthz
+	handle @api {
+		reverse_proxy {$GATEWAY_UPSTREAM:gateway:8080}
+	}
+
+	# Everything else is the static Next.js export.
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}
