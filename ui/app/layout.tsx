@@ -2,8 +2,8 @@ import './globals.css';
 import type { ReactNode } from 'react';
 
 export const metadata = {
-  title: 'TgApi Console',
-  description: 'Management console for the TgApi service',
+  title: 'TG Control API Console',
+  description: 'Management console for Telegram Control API Server',
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {

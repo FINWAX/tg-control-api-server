@@ -16,10 +16,10 @@ import (
 
 	"github.com/zelenin/go-tdlib/client"
 
-	"tgapi/internal/api"
-	"tgapi/internal/secret"
-	"tgapi/internal/session"
-	"tgapi/internal/store"
+	"github.com/FINWAX/tg-control-api-server/internal/api"
+	"github.com/FINWAX/tg-control-api-server/internal/secret"
+	"github.com/FINWAX/tg-control-api-server/internal/session"
+	"github.com/FINWAX/tg-control-api-server/internal/store"
 )
 
 func main() {

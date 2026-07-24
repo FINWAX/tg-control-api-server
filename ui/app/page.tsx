@@ -60,7 +60,7 @@ function Gate({ onDone }: { onDone: () => void }) {
   return (
     <div className="gate">
       <form className="card" onSubmit={submit}>
-        <h1>TgApi Console</h1>
+        <h1>TG Control API Console</h1>
         <p>Enter the master API token to sign in.</p>
         <label className="field">
           <span>API token</span>
@@ -154,7 +154,7 @@ function Console({ onSignOut }: { onSignOut: () => void }) {
     <div className="wrap">
       <header className="top">
         <h1>
-          TgApi <span className="dim">Console</span>
+          TG Control API <span className="dim">Console</span>
         </h1>
         <div className="spacer" />
         <button className="btn ghost sm" onClick={() => refresh()}>

@@ -17,7 +17,7 @@ import (
 	"net/http"
 	"time"
 
-	"tgapi/internal/store"
+	"github.com/FINWAX/tg-control-api-server/internal/store"
 )
 
 type outItem struct {
@@ -117,7 +117,7 @@ func (m *Manager) post(httpc *http.Client, d store.Delivery) error {
 		}
 		mac := hmac.New(sha256.New, secret)
 		mac.Write(d.Payload)
-		req.Header.Set("X-Tgapi-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+		req.Header.Set("X-Tgcontrol-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
 	}
 	resp, err := httpc.Do(req)
 	if err != nil {

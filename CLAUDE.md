@@ -1,4 +1,4 @@
-# TgApi - Dev
+# Telegram Control API Server - Dev
 
 ## Контекст
 Контейнеризированный внутренний сервис-фасад над Telegram: выводит наружу
@@ -39,7 +39,7 @@ API и шифруются в БД; в .env только инфра-конфиг 
 - Логи: `docker compose logs -f gateway`
 - Остановить: `docker compose down` (тома pgdata/tdlibdata сохраняются;
   `down -v` - снести вместе с данными).
-- Smoke тулчейна: `docker build -t tgapi . && docker run --rm tgapi ./smoke`
+- Smoke тулчейна: `docker build -t tg-control-api-server . && docker run --rm tg-control-api-server ./smoke`
 
 Эндпойнты:
 - `GET /healthz`

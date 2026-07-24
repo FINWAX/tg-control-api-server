@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"tgapi/internal/store"
+	"github.com/FINWAX/tg-control-api-server/internal/store"
 )
 
 type Router struct {

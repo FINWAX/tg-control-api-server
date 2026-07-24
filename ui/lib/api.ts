@@ -2,7 +2,7 @@
 // and kept in localStorage; every request carries it as a Bearer header. Calls
 // are same-origin (/v1/*), reverse-proxied to the gateway by Caddy.
 
-const TOKEN_KEY = 'tgapi_token';
+const TOKEN_KEY = 'tgcontrol_token';
 
 export function getToken(): string {
   if (typeof window === 'undefined') return '';

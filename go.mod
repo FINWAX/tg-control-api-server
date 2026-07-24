@@ -1,4 +1,4 @@
-module tgapi
+module github.com/FINWAX/tg-control-api-server
 
 go 1.23
 

@@ -5,5 +5,5 @@
 # Usage:  ./scripts/test.sh
 set -eu
 
-docker build --target go-builder -t tgapi-gobuild .
-docker run --rm tgapi-gobuild go test ./...
+docker build --target go-builder -t tg-control-api-server-build .
+docker run --rm tg-control-api-server-build go test ./...

@@ -1,4 +1,4 @@
-# TgApi
+# Telegram Control API Server
 
 A containerized internal service that exposes an HTTP interface to Telegram
 **user accounts** (like TelegramApiServer) and **bots** (like the tdlight Bot
@@ -80,7 +80,7 @@ workers, and scoped tokens without hand-rolling curl.
 Toolchain smoke test:
 
 ```sh
-docker build -t tgapi . && docker run --rm tgapi ./smoke
+docker build -t tg-control-api-server . && docker run --rm tg-control-api-server ./smoke
 ```
 
 ## Development

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# footprint.sh — measure the runtime footprint of a running TgApi stack:
+# footprint.sh — measure the runtime footprint of a running stack:
 # per-container memory, per-session disk on the shared TDLib volume, and a
 # rough per-account estimate. Re-run as the account count grows to track
 # density. Requires the stack to be up (docker compose up -d).

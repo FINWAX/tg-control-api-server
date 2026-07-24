@@ -15,7 +15,7 @@ services:
 
   gateway:
     build: .
-    image: tgapi:local
+    image: tg-control-api-server:local
     command: ["./gateway"]
     restart: unless-stopped
     depends_on:
@@ -30,7 +30,7 @@ services:
 
   worker:
     build: .
-    image: tgapi:local
+    image: tg-control-api-server:local
     command: ["./worker"]
     restart: unless-stopped
     depends_on:
@@ -53,7 +53,7 @@ services:
   # CORS). Enable with `docker compose --profile ui up -d`.
   ui:
     build: ./ui
-    image: tgapi-ui:local
+    image: tg-control-api-server-ui:local
     restart: unless-stopped
     depends_on:
       - gateway

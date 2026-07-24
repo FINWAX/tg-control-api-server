@@ -8,10 +8,10 @@ import (
 	"errors"
 	"net/http"
 
-	"tgapi/internal/secret"
-	"tgapi/internal/session"
-	"tgapi/internal/store"
-	"tgapi/internal/tdjson"
+	"github.com/FINWAX/tg-control-api-server/internal/secret"
+	"github.com/FINWAX/tg-control-api-server/internal/session"
+	"github.com/FINWAX/tg-control-api-server/internal/store"
+	"github.com/FINWAX/tg-control-api-server/internal/tdjson"
 )
 
 type Server struct {

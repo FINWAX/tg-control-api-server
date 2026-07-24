@@ -20,9 +20,9 @@ import (
 
 	"github.com/zelenin/go-tdlib/client"
 
-	"tgapi/internal/secret"
-	"tgapi/internal/store"
-	"tgapi/internal/tdjson"
+	"github.com/FINWAX/tg-control-api-server/internal/secret"
+	"github.com/FINWAX/tg-control-api-server/internal/store"
+	"github.com/FINWAX/tg-control-api-server/internal/tdjson"
 )
 
 // liveSession is the in-process state of one account.
@@ -440,7 +440,7 @@ func (m *Manager) buildParams(dbDir string, dbKey []byte, apiID int32, apiHash s
 		ApiId:                 apiID,
 		ApiHash:               apiHash,
 		SystemLanguageCode:    "en",
-		DeviceModel:           "tgapi",
+		DeviceModel:           "tgcontrol",
 		SystemVersion:         "1",
 		ApplicationVersion:    "0.1",
 	}

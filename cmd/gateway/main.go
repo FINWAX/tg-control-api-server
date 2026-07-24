@@ -10,8 +10,8 @@ import (
 	"os"
 	"time"
 
-	"tgapi/internal/router"
-	"tgapi/internal/store"
+	"github.com/FINWAX/tg-control-api-server/internal/router"
+	"github.com/FINWAX/tg-control-api-server/internal/store"
 )
 
 func main() {
