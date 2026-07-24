@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -143,6 +144,14 @@ const (
 	claimBatch        = 8                // max sessions claimed per reconcile
 	shedPerTick       = 2                // max sessions shed per reconcile
 	openBackoff       = 20 * time.Second // wait this long before retrying a failed open
+)
+
+// flood-wait auto-retry bounds: TDLib FLOOD_WAIT (code 420) asks the caller to
+// wait N seconds. Short waits are absorbed transparently; longer ones surface as
+// a structured error so the client decides.
+const (
+	maxAutoFloodWaitSec = 5 // only auto-retry flood-waits up to this many seconds
+	maxFloodRetries     = 2 // max transparent flood-wait retries per call
 )
 
 func NewManager(st *store.Store, sec *secret.Box, dataDir, workerID, selfAddr string, capacity int) *Manager {
@@ -750,10 +759,13 @@ var blockedMethods = map[string]bool{
 // must be rejected when requested through the public API.
 func IsBlockedMethod(method string) bool { return blockedMethods[method] }
 
-// Call runs a dynamic td_api method on an authorized session. On a "Chat not
-// found" error for a private chat (positive chat_id == user id), it force-loads
-// the chat via createPrivateChat and retries once — TDLib lazy-loads dialogs, so
-// a first send to a not-yet-materialized private chat would otherwise fail.
+// Call runs a dynamic td_api method on an authorized session. Two conveniences
+// wrap the raw dispatch: (1) a string chat_id ("@username") is resolved to its
+// numeric id via searchPublicChat, so callers can address public peers without a
+// manual resolve/access_hash step; (2) a "Chat not found" for a private chat
+// (positive chat_id == user id) force-loads it via createPrivateChat and retries
+// once, since TDLib lazy-loads dialogs. Short FLOOD_WAIT errors are retried
+// transparently; longer ones surface as a structured error.
 func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMessage) (json.RawMessage, error) {
 	ls := m.get(id)
 	if ls == nil {
@@ -763,16 +775,117 @@ func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMe
 	if cl == nil {
 		return nil, fmt.Errorf("session is %s, not authorized", ls.status_())
 	}
-	res, err := tdjson.Call(ctx, cl, method, params)
+
+	params, err := m.resolveChatUsername(ctx, cl, params)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := m.sendWithFloodRetry(ctx, cl, method, params)
 	if err != nil && isChatNotFound(err) {
 		if uid, ok := positiveChatID(params); ok {
 			if _, e := tdjson.Call(ctx, cl, "createPrivateChat", privateChatParams(uid)); e == nil {
 				log.Printf("call %s: resolved private chat %d, retrying %s", id, uid, method)
-				res, err = tdjson.Call(ctx, cl, method, params)
+				res, err = m.sendWithFloodRetry(ctx, cl, method, params)
 			}
 		}
 	}
 	return res, err
+}
+
+// sendWithFloodRetry dispatches a method, transparently retrying short
+// FLOOD_WAIT (code 420) responses after the wait TDLib requests.
+func (m *Manager) sendWithFloodRetry(ctx context.Context, cl *client.Client, method string, params json.RawMessage) (json.RawMessage, error) {
+	for attempt := 0; ; attempt++ {
+		res, err := tdjson.Call(ctx, cl, method, params)
+		if err == nil {
+			return res, nil
+		}
+		secs, ok := floodWaitSeconds(err)
+		if !ok || secs > maxAutoFloodWaitSec || attempt >= maxFloodRetries {
+			return res, err
+		}
+		log.Printf("call %s: FLOOD_WAIT %ds, retrying (attempt %d)", method, secs, attempt+1)
+		select {
+		case <-time.After(time.Duration(secs) * time.Second):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// floodWaitSeconds returns the retry-after seconds of a TDLib FLOOD_WAIT error
+// ("Too Many Requests: retry after N"), or ok=false for anything else.
+func floodWaitSeconds(err error) (int, bool) {
+	var te *tdjson.Error
+	if !errors.As(err, &te) || te.Code != 420 {
+		return 0, false
+	}
+	const marker = "retry after "
+	i := strings.LastIndex(te.Message, marker)
+	if i < 0 {
+		return 0, false
+	}
+	n, perr := strconv.Atoi(strings.TrimSpace(te.Message[i+len(marker):]))
+	if perr != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// resolveChatUsername rewrites a string chat_id ("@name" or "name") to the
+// numeric id of the resolved public chat. A numeric chat_id passes through
+// untouched (no extra call).
+func (m *Manager) resolveChatUsername(ctx context.Context, cl *client.Client, params json.RawMessage) (json.RawMessage, error) {
+	uname, ok := stringChatID(params)
+	if !ok {
+		return params, nil
+	}
+	uname = strings.TrimPrefix(strings.TrimSpace(uname), "@")
+	if uname == "" {
+		return params, nil
+	}
+	q, _ := json.Marshal(map[string]any{"username": uname})
+	res, err := tdjson.Call(ctx, cl, "searchPublicChat", q)
+	if err != nil {
+		return nil, fmt.Errorf("resolve @%s: %w", uname, err)
+	}
+	var chat struct {
+		ID int64 `json:"id"`
+	}
+	if json.Unmarshal(res, &chat) != nil || chat.ID == 0 {
+		return nil, fmt.Errorf("resolve @%s: no chat id", uname)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(params, &obj); err != nil {
+		return nil, err
+	}
+	obj["chat_id"], _ = json.Marshal(chat.ID)
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("call: resolved @%s -> chat %d", uname, chat.ID)
+	return out, nil
+}
+
+// stringChatID returns the chat_id when it is a JSON string (a username), or
+// ok=false when it is numeric or absent.
+func stringChatID(params json.RawMessage) (string, bool) {
+	if len(params) == 0 {
+		return "", false
+	}
+	var obj struct {
+		ChatID json.RawMessage `json:"chat_id"`
+	}
+	if json.Unmarshal(params, &obj) != nil || len(obj.ChatID) == 0 || obj.ChatID[0] != '"' {
+		return "", false
+	}
+	var s string
+	if json.Unmarshal(obj.ChatID, &s) != nil {
+		return "", false
+	}
+	return s, true
 }
 
 func isChatNotFound(err error) bool {
