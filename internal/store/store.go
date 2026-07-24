@@ -14,110 +14,18 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// schema is applied on startup; idempotent (IF NOT EXISTS).
-const schema = `
-CREATE TABLE IF NOT EXISTS tg_app (
-  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  api_id       integer NOT NULL,
-  api_hash_enc bytea   NOT NULL,
-  label        text,
-  created_at   timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS proxy (
-  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  type       text NOT NULL CHECK (type IN ('socks5','http','mtproto')),
-  host       text NOT NULL,
-  port       integer NOT NULL,
-  username   text,
-  secret_enc bytea,
-  label      text,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS session (
-  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  kind          text NOT NULL CHECK (kind IN ('user','bot')),
-  app_id        uuid NOT NULL REFERENCES tg_app(id),
-  proxy_id      uuid REFERENCES proxy(id),
-  phone         text,
-  bot_token_enc bytea,
-  label         text,
-  status        text NOT NULL DEFAULT 'new',
-  db_dir        text UNIQUE,
-  db_key_enc    bytea,
-  worker_id     text,
-  last_seen_at  timestamptz,
-  created_at    timestamptz NOT NULL DEFAULT now(),
-  updated_at    timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS session_status_idx ON session (status);
-CREATE INDEX IF NOT EXISTS session_kind_idx   ON session (kind);
-
-CREATE TABLE IF NOT EXISTS update_subscription (
-  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  session_id uuid NOT NULL REFERENCES session(id) ON DELETE CASCADE,
-  kind       text NOT NULL DEFAULT 'webhook' CHECK (kind IN ('webhook')),
-  url        text NOT NULL,
-  secret_enc bytea,
-  filters    jsonb,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (session_id, kind)
-);
-
-CREATE TABLE IF NOT EXISTS webhook_delivery (
-  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  session_id  uuid NOT NULL REFERENCES session(id) ON DELETE CASCADE,
-  payload     jsonb NOT NULL,
-  status      text NOT NULL DEFAULT 'pending'
-              CHECK (status IN ('pending','delivered','failed')),
-  attempts    integer NOT NULL DEFAULT 0,
-  next_try_at timestamptz NOT NULL DEFAULT now(),
-  created_at  timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS webhook_delivery_due_idx ON webhook_delivery (status, next_try_at);
-
-CREATE TABLE IF NOT EXISTS worker (
-  id           text PRIMARY KEY,
-  addr         text NOT NULL,
-  last_seen_at timestamptz NOT NULL DEFAULT now()
-);
-
--- Scoped API tokens. The master token lives in env; these are additional,
--- non-master tokens that may only invoke a session's /call and read its status.
--- Their reach is the union of: all_sessions, an explicit session list, and all
--- sessions of listed apps. Only the sha256 of the secret is stored.
-CREATE TABLE IF NOT EXISTS api_token (
-  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  name         text,
-  secret_hash  bytea NOT NULL UNIQUE,
-  enabled      boolean NOT NULL DEFAULT true,
-  all_sessions boolean NOT NULL DEFAULT false,
-  created_at   timestamptz NOT NULL DEFAULT now()
-);
-CREATE TABLE IF NOT EXISTS api_token_app (
-  token_id uuid NOT NULL REFERENCES api_token(id) ON DELETE CASCADE,
-  app_id   uuid NOT NULL REFERENCES tg_app(id) ON DELETE CASCADE,
-  PRIMARY KEY (token_id, app_id)
-);
-CREATE TABLE IF NOT EXISTS api_token_session (
-  token_id   uuid NOT NULL REFERENCES api_token(id) ON DELETE CASCADE,
-  session_id uuid NOT NULL REFERENCES session(id) ON DELETE CASCADE,
-  PRIMARY KEY (token_id, session_id)
-);
-`
-
 type Store struct {
 	pool *pgxpool.Pool
 }
 
-// schemaLockKey serializes concurrent schema application. With a gateway and
-// several workers all starting at once, unguarded CREATE TABLE IF NOT EXISTS can
-// collide on catalog inserts (duplicate pg_type). A transaction-scoped advisory
-// lock makes the first starter apply the schema while the rest wait, then no-op.
+// schemaLockKey serializes concurrent migration. With a gateway and several
+// workers all starting at once, unguarded DDL can collide on catalog inserts
+// (duplicate pg_type). A transaction-scoped advisory lock makes the first
+// starter run pending migrations while the rest wait, then see none pending.
 const schemaLockKey = 0x7467617069 // "tgapi"
 
-// New connects, verifies, and applies the schema (serialized across processes).
+// New connects, verifies, and brings the schema up to date by running any
+// pending migrations (serialized across processes; see applyMigrations).
 func New(ctx context.Context, dsn string) (*Store, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -137,7 +45,7 @@ func New(ctx context.Context, dsn string) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
-	if _, err := tx.Exec(ctx, schema); err != nil {
+	if err := applyMigrations(ctx, tx); err != nil {
 		pool.Close()
 		return nil, err
 	}

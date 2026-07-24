@@ -188,6 +188,39 @@ func assertGrant(t *testing.T, st *Store, tokenID, sessionID string, want bool) 
 	}
 }
 
+func TestMigrationsIdempotent(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	// The baseline migration is recorded, and no version is applied twice.
+	var maxVer, rows int
+	if err := st.pool.QueryRow(ctx,
+		`SELECT COALESCE(MAX(version),0), COUNT(*) FROM schema_migration`).Scan(&maxVer, &rows); err != nil {
+		t.Fatalf("read schema_migration: %v", err)
+	}
+	if maxVer != len(migrations) || rows != len(migrations) {
+		t.Fatalf("schema_migration = (max %d, rows %d), want %d each", maxVer, rows, len(migrations))
+	}
+
+	// Re-running New against the same database applies nothing new and preserves
+	// data (an app created before the second run survives).
+	appID := mkApp(t, st, "keep")
+	st2, err := New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("second New: %v", err)
+	}
+	defer st2.Close()
+	if apps, _ := st2.ListApps(ctx); len(apps) != 1 || apps[0].ID != appID {
+		t.Fatalf("data not preserved across re-migration: %+v", apps)
+	}
+	if err := st2.pool.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migration`).Scan(&rows); err != nil {
+		t.Fatalf("recount schema_migration: %v", err)
+	}
+	if rows != len(migrations) {
+		t.Fatalf("schema_migration rows after re-run = %d, want %d", rows, len(migrations))
+	}
+}
+
 func TestOwnershipClaimAndRoute(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
