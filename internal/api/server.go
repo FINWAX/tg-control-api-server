@@ -5,6 +5,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"tgapi/internal/secret"
@@ -66,6 +67,40 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 	})
 }
 
+// writeCallErr renders a td_api dispatch error. A TDLib error becomes a
+// structured envelope ({code, message, source:"tdlib"}) with an HTTP status
+// mapped from the TDLib code; anything else falls back to a 502 string error.
+func writeCallErr(w http.ResponseWriter, err error) {
+	var te *tdjson.Error
+	if errors.As(err, &te) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(httpStatusForTd(te.Code))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok": false,
+			"error": map[string]any{
+				"code": te.Code, "message": te.Message, "source": "tdlib",
+			},
+		})
+		return
+	}
+	writeErr(w, http.StatusBadGateway, err.Error())
+}
+
+// httpStatusForTd maps a TDLib error code to an HTTP status. TDLib codes largely
+// mirror HTTP (400/401/403/404/…); 420 is FLOOD_WAIT (rate limit).
+func httpStatusForTd(code int) int {
+	switch {
+	case code == 0:
+		return http.StatusBadGateway // unparseable / no code
+	case code == 420:
+		return http.StatusTooManyRequests
+	case code >= 400 && code <= 599:
+		return code
+	default:
+		return http.StatusBadRequest
+	}
+}
+
 func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
@@ -94,7 +129,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := tdjson.ExecuteSync(req.Method, req.Params)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeCallErr(w, err)
 		return
 	}
 	writeOK(w, result)
@@ -186,7 +221,7 @@ func (s *Server) handleCreateBot(w http.ResponseWriter, r *http.Request) {
 	}
 	id, me, err := s.mgr.CreateBot(r.Context(), req.AppID, req.Token, req.ProxyID, req.Label)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+		writeCallErr(w, err)
 		return
 	}
 	writeOK(w, map[string]any{"id": id, "status": "authorized", "me": json.RawMessage(me)})
@@ -208,7 +243,7 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	id, status, err := s.mgr.CreateUser(r.Context(), req.AppID, req.Phone, req.ProxyID, req.Label)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+		writeCallErr(w, err)
 		return
 	}
 	writeOK(w, map[string]any{"id": id, "status": status})
@@ -262,7 +297,7 @@ func (s *Server) handleCall(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.mgr.Call(r.Context(), r.PathValue("id"), req.Method, req.Params)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+		writeCallErr(w, err)
 		return
 	}
 	writeOK(w, json.RawMessage(result))

@@ -23,10 +23,10 @@ type rawRequest struct {
 }
 
 func (r *rawRequest) GetFunctionName() string { return r.method }
-func (r *rawRequest) SetExtra(e string)        { r.extra = e }
-func (r *rawRequest) GetExtra() string         { return r.extra }
-func (r *rawRequest) SetType(string)           {} // @type is emitted from method
-func (r *rawRequest) GetType() string          { return r.method }
+func (r *rawRequest) SetExtra(e string)       { r.extra = e }
+func (r *rawRequest) GetExtra() string        { return r.extra }
+func (r *rawRequest) SetType(string)          {} // @type is emitted from method
+func (r *rawRequest) GetType() string         { return r.method }
 
 func (r *rawRequest) MarshalJSON() ([]byte, error) {
 	obj := make(map[string]json.RawMessage, len(r.params)+2)
@@ -40,6 +40,28 @@ func (r *rawRequest) MarshalJSON() ([]byte, error) {
 		obj["@extra"] = e
 	}
 	return json.Marshal(obj)
+}
+
+// Error is a structured TDLib error (the td_api `error` object). It carries the
+// TDLib error code and message so callers can surface a proper envelope and map
+// an HTTP status, instead of flattening everything into a string.
+type Error struct {
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Raw     json.RawMessage `json:"-"`
+}
+
+func (e *Error) Error() string { return fmt.Sprintf("tdlib %d: %s", e.Code, e.Message) }
+
+// parseTdError turns a raw td_api error object into an *Error. If it can't be
+// parsed, Code stays 0 and the raw JSON becomes the message.
+func parseTdError(data json.RawMessage) error {
+	var e Error
+	if err := json.Unmarshal(data, &e); err != nil || e.Message == "" {
+		return &Error{Message: string(data), Raw: data}
+	}
+	e.Raw = data
+	return &e
 }
 
 // ExecuteSync resolves and runs a synchronous td_api method via td_execute.
@@ -59,7 +81,7 @@ func ExecuteSync(method string, params json.RawMessage) (json.RawMessage, error)
 		return nil, err
 	}
 	if resp.MetaType == "error" {
-		return nil, fmt.Errorf("tdlib: %s", string(resp.Data))
+		return nil, parseTdError(resp.Data)
 	}
 	return resp.Data, nil
 }
@@ -80,7 +102,7 @@ func Call(ctx context.Context, cl *client.Client, method string, params json.Raw
 		return nil, err
 	}
 	if resp.MetaType == "error" {
-		return nil, fmt.Errorf("tdlib: %s", string(resp.Data))
+		return nil, parseTdError(resp.Data)
 	}
 	return resp.Data, nil
 }
