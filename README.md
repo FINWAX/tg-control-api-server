@@ -1,5 +1,7 @@
 # Telegram Control API Server
 
+[![CI](https://github.com/FINWAX/tg-control-api-server/actions/workflows/ci.yml/badge.svg)](https://github.com/FINWAX/tg-control-api-server/actions/workflows/ci.yml)
+
 A containerized internal service that exposes an HTTP interface to Telegram
 **user accounts** (like TelegramApiServer) and **bots** (like the tdlight Bot
 API) over a single engine — TDLib. Credentials, session persistence, and

@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Unit + integration tests run in the same toolchain image as local dev
+      # (they link libtdjson), so CI reuses the repo scripts verbatim.
+      - name: Unit tests
+        run: bash scripts/test.sh
+
+      - name: Integration tests
+        run: bash scripts/test-integration.sh
+
+      # Validate the full runtime and UI image builds compile end to end.
+      - name: Build runtime image
+        run: docker build -t tg-control-api-server:ci .
+
+      - name: Build UI image
+        run: docker build -t tg-control-api-server-ui:ci ./ui
