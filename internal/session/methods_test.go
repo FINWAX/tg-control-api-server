@@ -140,6 +140,40 @@ func TestExtractMessageIDs(t *testing.T) {
 	}
 }
 
+func TestFileObjectParsing(t *testing.T) {
+	// getRemoteFile / downloadFile return a td_api "file" object.
+	file := json.RawMessage(`{"@type":"file","id":42,"size":1024,
+		"local":{"path":"/data/s/files/photo.jpg","is_downloading_completed":true}}`)
+	if id, err := fileIDFromObj(file); err != nil || id != 42 {
+		t.Fatalf("fileIDFromObj = (%d, %v)", id, err)
+	}
+	if p, err := localPathFromFile(file); err != nil || p != "/data/s/files/photo.jpg" {
+		t.Fatalf("localPathFromFile = (%q, %v)", p, err)
+	}
+	// an incomplete download (no local path) is an error
+	if _, err := localPathFromFile(json.RawMessage(`{"local":{"path":"","is_downloading_completed":false}}`)); err == nil {
+		t.Fatal("empty local path should be an error")
+	}
+	if _, err := fileIDFromObj(json.RawMessage(`{"id":0}`)); err == nil {
+		t.Fatal("zero id should be an error")
+	}
+}
+
+func TestFileTypeFromError(t *testing.T) {
+	if ft := fileTypeFromError(&tdjson.Error{Code: 400, Message: "Can't use file of type Photo as <invalid>"}); ft != "fileTypePhoto" {
+		t.Fatalf("photo -> %q, want fileTypePhoto", ft)
+	}
+	if ft := fileTypeFromError(&tdjson.Error{Code: 400, Message: "Can't use file of type Video as <invalid>"}); ft != "fileTypeVideo" {
+		t.Fatalf("video -> %q, want fileTypeVideo", ft)
+	}
+	if ft := fileTypeFromError(&tdjson.Error{Code: 400, Message: "some unrelated error"}); ft != "" {
+		t.Fatalf("unrelated -> %q, want empty", ft)
+	}
+	if ft := fileTypeFromError(errors.New("plain error")); ft != "" {
+		t.Fatalf("non-tdlib -> %q, want empty", ft)
+	}
+}
+
 func TestStringChatID(t *testing.T) {
 	cases := []struct {
 		in   string

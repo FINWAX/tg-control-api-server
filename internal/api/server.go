@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 
 	"github.com/FINWAX/tg-control-api-server/internal/secret"
 	"github.com/FINWAX/tg-control-api-server/internal/session"
@@ -43,6 +45,8 @@ func NewServer(st *store.Store, sec *secret.Box, mgr *session.Manager) http.Hand
 	mux.HandleFunc("DELETE /v1/bot/{id}/updates/webhook", s.handleDeleteWebhook)
 	mux.HandleFunc("GET /v1/user/{id}", s.handleGetSession)
 	mux.HandleFunc("GET /v1/bot/{id}", s.handleGetSession)
+	mux.HandleFunc("GET /v1/user/{id}/files/{file_id}", s.handleDownloadFile)
+	mux.HandleFunc("GET /v1/bot/{id}/files/{file_id}", s.handleDownloadFile)
 	mux.HandleFunc("DELETE /v1/user/{id}", s.handleDeleteSession)
 	mux.HandleFunc("DELETE /v1/bot/{id}", s.handleDeleteSession)
 	mux.HandleFunc("PATCH /v1/user/{id}", s.handleUpdateSession)
@@ -372,6 +376,46 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeOK(w, map[string]any{"status": "deleted"})
+}
+
+// handleDownloadFile downloads a file (by numeric file_id in the path, or by a
+// persistent ?remote_id=) onto this worker and streams it back with Range
+// support. All td_api work happens before any bytes are written, so an error can
+// still be reported as a JSON envelope; only once the file is open do we stream.
+// ?delete=1 drops the file from TDLib storage after a full (non-Range) download.
+func (s *Server) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	path, fileID, err := s.mgr.DownloadFile(r.Context(), id, r.PathValue("file_id"), r.URL.Query().Get("remote_id"))
+	if err != nil {
+		switch {
+		case errors.Is(err, session.ErrBadFileRef):
+			writeErr(w, http.StatusBadRequest, err.Error())
+		case err.Error() == "session not found":
+			writeErr(w, http.StatusNotFound, err.Error())
+		default:
+			writeCallErr(w, err) // td_api error -> structured; otherwise 502
+		}
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "downloaded file unavailable")
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "stat downloaded file")
+		return
+	}
+	name := filepath.Base(path)
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+name+"\"")
+	isRange := r.Header.Get("Range") != ""
+	http.ServeContent(w, r, name, fi.ModTime(), f) // handles Content-Type/Length + Range
+	// Only prune on a full download; a partial (Range) response is likely a resume.
+	if r.URL.Query().Get("delete") == "1" && !isRange {
+		s.mgr.DeleteTdFile(r.Context(), id, fileID)
+	}
 }
 
 func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {

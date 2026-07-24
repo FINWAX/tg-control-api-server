@@ -95,6 +95,8 @@ func New(st *store.Store, stale time.Duration, token string, uploads *upload.Sto
 	mux.HandleFunc("DELETE /v1/bot/{id}/updates/webhook", rt.scoped)
 	mux.HandleFunc("GET /v1/user/{id}", rt.scoped)
 	mux.HandleFunc("GET /v1/bot/{id}", rt.scoped)
+	mux.HandleFunc("GET /v1/user/{id}/files/{file_id}", rt.scoped)
+	mux.HandleFunc("GET /v1/bot/{id}/files/{file_id}", rt.scoped)
 	mux.HandleFunc("DELETE /v1/user/{id}", rt.deleteSession)
 	mux.HandleFunc("DELETE /v1/bot/{id}", rt.deleteSession)
 	mux.HandleFunc("PATCH /v1/user/{id}", rt.updateSession)
@@ -181,6 +183,9 @@ func sessionTarget(method, path string) (string, bool) {
 	}
 	if method == http.MethodPost && len(parts) == 4 && parts[3] == "call" {
 		return id, true // POST /v1/{kind}/{id}/call
+	}
+	if method == http.MethodGet && len(parts) == 5 && parts[3] == "files" {
+		return id, true // GET /v1/{kind}/{id}/files/{file_id} — download
 	}
 	return "", false
 }

@@ -53,6 +53,9 @@ API и шифруются в БД; в .env только инфра-конфиг 
 - `POST /v1/files?name=` -> {path} (single-shot); `PATCH/GET /v1/files/{id}`,
   `POST /v1/files/{id}/complete`, `DELETE /v1/files/{id}` (resumable). Файл для
   отправки медиа через inputFileLocal; общий том, чистка событийно + по TTL.
+- `GET /v1/{user|bot}/{id}/files/{file_id}[?remote_id=][&delete=1]` -> стрим файла
+  с диска воркера (downloadFile synchronous, http.ServeContent + Range). Для
+  краулинга; вход по локальному file_id или постоянному remote_id.
 - `GET /v1/{user|bot}/{id}` -> статус
 
 Прокси на сессию поддерживается (addProxy), в локальном случае опционален; смысл -

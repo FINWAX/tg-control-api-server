@@ -11,11 +11,13 @@ func TestSessionTarget(t *testing.T) {
 		wantID       string
 		wantOK       bool
 	}{
-		// allowed: a session's /call and its status read
+		// allowed: a session's /call, its status read, and file download
 		{"GET", "/v1/user/abc", "abc", true},
 		{"GET", "/v1/bot/xyz", "xyz", true},
 		{"POST", "/v1/user/abc/call", "abc", true},
 		{"POST", "/v1/bot/xyz/call", "xyz", true},
+		{"GET", "/v1/user/abc/files/123", "abc", true},
+		{"GET", "/v1/bot/xyz/files/123", "xyz", true},
 
 		// denied: management and lifecycle
 		{"POST", "/v1/user/abc", "", false},
@@ -31,6 +33,8 @@ func TestSessionTarget(t *testing.T) {
 		{"GET", "/v1/user", "", false},
 		{"POST", "/v1/bot/abc/call/extra", "", false},
 		{"GET", "/v1/group/abc", "", false},
+		{"POST", "/v1/user/abc/files/123", "", false}, // download is GET-only
+		{"GET", "/v1/user/abc/files", "", false},      // needs a file id
 	}
 	for _, c := range cases {
 		gotID, gotOK := sessionTarget(c.method, c.path)

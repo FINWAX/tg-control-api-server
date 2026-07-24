@@ -155,6 +155,7 @@ Every request except `GET /healthz` must carry `Authorization: Bearer <token>`.
 | `POST /v1/execute` `{method, params}` | Synchronous td_api call (no session) |
 | `POST /v1/files?name=` | Upload a file → `{path}` (single-shot; see [Sending files](#sending-files)) |
 | `PATCH/GET /v1/files/{id}`, `POST /v1/files/{id}/complete`, `DELETE /v1/files/{id}` | Resumable/chunked upload |
+| `GET /v1/{user\|bot}/{id}/files/{file_id}` | Download a file, streamed with Range (see [Downloading files](#downloading-files-crawling)) |
 | `PUT/DELETE /v1/{user\|bot}/{id}/updates/webhook` | Manage update delivery |
 | `GET  /v1/{user\|bot}/{id}` | Session status |
 | `PATCH /v1/{user\|bot}/{id}` `{label?, proxy_id?}` | Rename / change proxy (applied live) |
@@ -212,6 +213,38 @@ uploads volume — a `/call` cannot reference any other path on the worker.
 Filenames keep their real name (the upload id lives in the directory, not the
 filename), capped at the filesystem's 255-byte limit; Telegram truncates long
 document names on its side.
+
+## Downloading files (crawling)
+
+Incoming media is referenced by a `file` object on the message: a local `id`
+(ephemeral, this session run), `remote.id` (a persistent reference), and
+`remote.unique_id` (a stable content fingerprint — the dedup key). Discover
+messages with `getChatHistory` / `searchChatMessages` (or in real time via the
+update webhook), then download.
+
+Stream a file straight from the owning worker's disk, with HTTP `Range` support:
+
+```sh
+# by the local file id from a message
+curl -s "$G/v1/user/$SID/files/1234" -H "Authorization: Bearer $TOKEN" -o out.jpg
+
+# by the persistent remote id (works later / after a restart, no live file_id)
+curl -s "$G/v1/user/$SID/files/0?remote_id=<remote_id>" \
+     -H "Authorization: Bearer $TOKEN" -o out.jpg
+
+# add &delete=1 to drop the file from TDLib storage after a full download
+```
+
+The download is synchronous (it blocks until TDLib has the whole file) and the
+bytes stream back — no base64. `Range` requests return `206 Partial Content`, so
+a large download can resume. For a crawl, persist `remote.id` (to re-fetch) and
+`remote.unique_id` (to skip duplicates); if a `remote.id` ever returns *file
+reference expired*, re-read the source message to refresh it. Bound disk during a
+crawl with `?delete=1`, or `deleteFile` / `optimizeStorage` via `/call`.
+
+The lower-level td_api path also works directly through `/call` (`downloadFile`
+→ `readFilePart`), but returns bytes as base64 in JSON — the streaming endpoint
+above is preferred for anything but small files.
 
 ## API tokens
 
