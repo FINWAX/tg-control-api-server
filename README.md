@@ -89,8 +89,9 @@ Unit tests link libtdjson (CGO), so they run inside the build image rather than
 on the host:
 
 ```sh
-./scripts/test.sh          # go test ./... in the toolchain image
-./scripts/footprint.sh     # measure per-account memory / disk of a running stack
+./scripts/test.sh              # unit tests (go test ./...) in the toolchain image
+./scripts/test-integration.sh  # Postgres-backed store tests against a throwaway DB
+./scripts/footprint.sh         # measure per-account memory / disk of a running stack
 ```
 
 ## API
