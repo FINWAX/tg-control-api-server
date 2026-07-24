@@ -242,6 +242,50 @@ Minimum one worker. Killing a worker (graceful or hard) fails its sessions over
 to peers within seconds. All replicas share the `tdlibdata` volume, so this
 assumes a single host; spreading across hosts would need shared storage.
 
+## Requirements and resource footprint
+
+The service is light: at the target scale (**under ~50 accounts, single host**)
+host resources are not the binding constraint — Telegram's per-account rate
+limits and proxy throughput are. Footprint is **linear in the number of
+accounts**, and you can re-measure any running stack with
+[`scripts/footprint.sh`](scripts/footprint.sh).
+
+Measured baseline (idle containers, RSS):
+
+| Component | Memory | Notes |
+| --- | --- | --- |
+| gateway | ~6 MiB | stateless, holds no TDLib clients |
+| postgres | ~40 MiB | registry; grows slowly (KiB per account) |
+| worker (base) | ~15 MiB | Go + libtdjson, before any session |
+| ui (optional) | ~12 MiB | Caddy + static export |
+
+Per account, on top of the worker base:
+
+| Account type | Memory (RSS) | Disk (tdlibdata) |
+| --- | --- | --- |
+| **bot** | ~2–4 MiB | ~0.1 MiB |
+| **user** | ~10–15 MiB | a few MiB, grows with the file cache |
+
+User sessions are heavier and their disk grows as TDLib caches downloaded media
+(message/chat databases are disabled by default; the file database is on — tune
+in `buildParams`, [internal/session/manager.go](internal/session/manager.go)).
+The `uploads` volume is transient: it holds in-flight uploads (up to
+`MAX_UPLOAD_BYTES`, default 2 GiB, each) and is cleaned on send completion and by
+the TTL sweep.
+
+**Recommended host** for up to ~50 accounts on one machine:
+
+- **CPU:** 1–2 vCPU (idle < 1%; brief spikes only during media transfer).
+- **RAM:** 1 GiB minimum, 2 GiB comfortable — covers Postgres plus an
+  all-user worst case (~50 × 15 MiB ≈ 0.75 GiB of clients) with headroom.
+- **Disk:** 10–20 GiB — Postgres is small; the rest is the TDLib file cache and
+  transient uploads. Size up if you push large media through the `uploads`
+  volume concurrently.
+
+To grow past one host, add workers (they scale linearly), but note the shared
+`tdlibdata`/`uploads` volumes assume a single host — see [Scaling
+workers](#scaling-workers).
+
 ## Observability
 
 OpenTelemetry is built in and opt-in. Set `OTEL_EXPORTER_OTLP_ENDPOINT` (plus any
