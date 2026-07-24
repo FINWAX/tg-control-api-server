@@ -11,6 +11,19 @@ authorization are all handled server-side. Aimed at self-hosted deployments of
 The public surface is native td_api JSON: you send a method name plus params and
 the service dispatches it on the right session. User and bot sessions never mix.
 
+## Management console
+
+An optional web console (Next.js served by Caddy) manages sessions, apps,
+proxies, workers, and scoped API tokens — no curl required. Enable it with the
+`ui` compose profile (see [Running](#running)).
+
+![Console dashboard](docs/assets/console-dashboard.png)
+
+Scoped API tokens grant per-session or per-app access, separate from the master
+token:
+
+![API tokens](docs/assets/console-tokens.png)
+
 ## Architecture
 
 Two planes, split into separate containers:
