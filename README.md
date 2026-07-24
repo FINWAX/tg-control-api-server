@@ -182,10 +182,14 @@ gateway/workers by an advisory lock). Migrations are forward-only and additive,
 so upgrading to a newer image never drops or rewrites existing data — just
 `docker compose pull && docker compose up -d`.
 
-For host-path **portability** (move a deployment by copying a directory rather
-than exporting Docker volumes), bind-mount the volumes to host paths via a
-`compose.override.yml` — see the comment at the bottom of
-[docker-compose.yml](docker-compose.yml).
+**Do not bind-mount `pgdata` / `tdlibdata` to a Windows or macOS drive** under
+Docker Desktop. TDLib's binlog and Postgres rely on POSIX atomic-rename and
+locking, which the Windows/macOS file-sharing bridge does not provide — it
+causes fatal binlog-rename crashes in the workers and can corrupt Postgres. Use
+named volumes (they live on the Linux VM's filesystem) and, if you need a
+host-path copy for portability or backup, export them on a schedule with
+`pg_dump` and `tar` rather than binding the live data. Bind mounts to a **native
+Linux path** are fine.
 
 ## Development
 

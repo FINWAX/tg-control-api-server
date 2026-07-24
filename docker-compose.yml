@@ -86,10 +86,12 @@ services:
       - "3080:80"
     profiles: ["ui"]
 
-# Named volumes keep data across `up`/`down` and rebuilds. For host-path
-# portability (move the deployment by copying a directory), bind-mount instead:
-# override pgdata/tdlibdata in a compose.override.yml, e.g.
-#   volumes: { pgdata: { driver_opts: { type: none, o: bind, device: /srv/tgc/pg } } }
+# Named volumes keep data across `up`/`down` and rebuilds. Keep pgdata and
+# tdlibdata on NAMED volumes (or a bind mount to a native Linux path) — TDLib's
+# binlog and Postgres need POSIX rename/lock semantics. NEVER bind-mount them to
+# a Windows/macOS drive under Docker Desktop: that bridge breaks atomic rename
+# and crashes the workers (fatal binlog-rename) and can corrupt Postgres. For
+# portability, back the named volumes up with pg_dump / `tar` on a schedule.
 volumes:
   pgdata:
   tdlibdata:
