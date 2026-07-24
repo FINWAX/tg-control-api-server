@@ -108,6 +108,66 @@ The gateway and workers expose a `/healthz` liveness endpoint and ship with
 Compose healthchecks, so `docker compose ps` reflects real readiness and the
 console only starts once the gateway is healthy.
 
+## Quickstart
+
+With the stack up, point at the gateway and set your master token:
+
+```sh
+export G=http://localhost:8080
+export TOKEN=<your API_TOKEN from .env>
+```
+
+**1. Register a Telegram app** (get `api_id`/`api_hash` from <https://my.telegram.org>):
+
+```sh
+curl -s "$G/v1/apps" -H "Authorization: Bearer $TOKEN" \
+  -d '{"api_id":123456,"api_hash":"...","label":"main"}'        # -> {app_id}
+```
+
+**2. Register a proxy** (optional, one per session recommended for user accounts):
+
+```sh
+curl -s "$G/v1/proxies" -H "Authorization: Bearer $TOKEN" \
+  -d '{"type":"socks5","host":"1.2.3.4","port":1080,"username":"u","password":"p"}'  # -> {proxy_id}
+```
+
+**3. Create a session.** A **bot** logs in non-interactively:
+
+```sh
+curl -s "$G/v1/bot" -H "Authorization: Bearer $TOKEN" \
+  -d '{"token":"<bot_token>","app_id":"<app_id>","proxy_id":"<proxy_id>"}'   # -> {id, status:authorized, me}
+```
+
+A **user** needs the login code (and the 2FA password if set):
+
+```sh
+curl -s "$G/v1/user" -H "Authorization: Bearer $TOKEN" \
+  -d '{"app_id":"<app_id>","phone":"+1555...","proxy_id":"<proxy_id>"}'       # -> {id, status:awaiting_code}
+curl -s "$G/v1/user/<id>/login/code"     -H "Authorization: Bearer $TOKEN" -d '{"code":"12345"}'
+curl -s "$G/v1/user/<id>/login/password" -H "Authorization: Bearer $TOKEN" -d '{"password":"..."}'   # only if 2FA
+```
+
+Save the session `id` as `$SID`.
+
+**4. Call any td_api method** on the session — the method name is resolved
+dynamically, so the full td_api surface is available:
+
+```sh
+curl -s "$G/v1/bot/$SID/call" -H "Authorization: Bearer $TOKEN" \
+  -d '{"method":"getMe","params":{}}'          # user sessions use /v1/user/$SID/call
+```
+
+**5. Receive updates** (new messages, etc.) by subscribing a webhook:
+
+```sh
+curl -s -X PUT "$G/v1/bot/$SID/updates/webhook" -H "Authorization: Bearer $TOKEN" \
+  -d '{"url":"https://your-app/telegram","secret":"...","filters":{"types":["updateNewMessage"]}}'
+```
+
+From here: [send media](#sending-files), [download / crawl](#downloading-files-crawling),
+issue [scoped tokens](#api-tokens), or drive it all from the
+[console](#management-console).
+
 ## Data and upgrades
 
 State lives in two named volumes: `pgdata` (the Postgres registry — apps,
@@ -333,6 +393,27 @@ metrics, and logs** over OTLP to any collector:
 
 With no endpoint configured, telemetry is disabled and the service just logs to
 stdout.
+
+## Deploying to production
+
+The compose defaults are for local development. Before a real deployment:
+
+- **Strong secrets.** Generate fresh `MASTER_KEY` and `API_TOKEN`
+  (`openssl rand -base64 32` each), and set real `POSTGRES_USER` /
+  `POSTGRES_PASSWORD` / `POSTGRES_DB` — don't ship the `tgapi:tgapi` default.
+- **Clean database.** Start on fresh volumes; don't carry over a development
+  `pgdata` (it holds test sessions and their secrets).
+- **TLS and a private network.** The API is a bearer token over plain HTTP —
+  terminate TLS in front of the gateway (reverse proxy) for anything but a
+  trusted private network. Workers are unauthenticated **by design**: never
+  publish their ports; only the gateway (and optionally the console) should be
+  reachable.
+- **Disk headroom** for the TDLib file cache and the transient `uploads` volume
+  — see [Requirements](#requirements-and-resource-footprint).
+
+Upgrades are `docker compose pull && docker compose up -d`: schema migrations
+apply automatically and are forward-only, so existing data is preserved (see
+[Data and upgrades](#data-and-upgrades)).
 
 ## License
 
