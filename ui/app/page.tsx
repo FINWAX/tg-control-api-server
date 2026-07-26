@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   api,
   ApiError,
@@ -8,8 +8,10 @@ import {
   setToken,
   clearToken,
   type App,
+  type CodeInfo,
   type Proxy,
   type Session,
+  type SessionState,
   type Token,
   type Worker,
 } from '../lib/api';
@@ -999,14 +1001,18 @@ function UserModal({
   const [appId, setAppId] = useState(apps[0]?.id || '');
   const [proxyId, setProxyId] = useState('');
   const [label, setLabel] = useState('');
+  // Set when the gateway refuses because this number already has a login
+  // waiting for input; resuming it is free, creating another costs a code.
+  const [pending, setPending] = useState('');
   const { busy, err, run } = useSubmit();
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
+    setPending('');
     try {
-      let res: { id: string; status: string } | null = null;
+      let res: SessionState | null = null;
       await run(async () => {
-        res = await api<{ id: string; status: string }>('POST', '/v1/user', {
+        res = await api<SessionState>('POST', '/v1/user', {
           app_id: appId,
           phone: phone.trim(),
           proxy_id: proxyId,
@@ -1015,7 +1021,7 @@ function UserModal({
       });
       onDone();
       if (res) {
-        const r = res as { id: string; status: string };
+        const r = res as SessionState;
         if (r.status === 'authorized') {
           flash('User authorized');
           onClose();
@@ -1023,8 +1029,8 @@ function UserModal({
           onLogin(r.id, r.status); // step into code / password
         }
       }
-    } catch {
-      /* inline */
+    } catch (e) {
+      if (e instanceof ApiError && e.sessionId) setPending(e.sessionId);
     }
   }
 
@@ -1043,6 +1049,16 @@ function UserModal({
         </label>
         {err && <div className="err">{err}</div>}
         <div className="modal-actions">
+          {pending && (
+            <button
+              type="button"
+              className="btn"
+              style={{ marginRight: 'auto' }}
+              onClick={() => onLogin(pending, 'awaiting_code')}
+            >
+              Resume that login
+            </button>
+          )}
           <button type="button" className="btn ghost" onClick={onClose}>
             Cancel
           </button>
@@ -1057,7 +1073,25 @@ function UserModal({
 
 // ---------------------------------------------------------------------------
 // Login flow (code -> password)
+//
+// Telegram rations code sends, so an open login is worth more than the dialog
+// around it. Nothing here throws one away by accident: the state is read live
+// from the owning worker rather than guessed, a rejected code or password
+// leaves the login standing so it can be retyped, a lost code is resent on the
+// same attempt, closing the dialog only hides it (the sessions list leads back),
+// and giving up is a separate, explicit, confirmed action.
 // ---------------------------------------------------------------------------
+
+// codeDelivery describes where Telegram put the code, from td_api's
+// authenticationCodeInfo: "via Sms to +1…, 5 digits".
+function codeDelivery(info?: CodeInfo): string {
+  if (!info) return '';
+  const kind = (info.type?.['@type'] || '').replace(/^authenticationCodeType/, '');
+  const parts = [kind ? `via ${kind}` : 'sent'];
+  if (info.phone_number) parts.push(`to ${info.phone_number}`);
+  if (info.type?.length) parts.push(`${info.type.length} digits`);
+  return 'Code ' + parts.join(', ');
+}
 
 function LoginModal({
   id,
@@ -1072,30 +1106,115 @@ function LoginModal({
   onDone: () => void;
   flash: Flash;
 }) {
-  const [status, setStatus] = useState(initialStatus);
+  const [state, setState] = useState<SessionState>({ id, status: initialStatus });
   const [value, setValue] = useState('');
+  const [confirmCancel, setConfirmCancel] = useState(false);
+  const [resendIn, setResendIn] = useState(0);
   const { busy, err, run } = useSubmit();
+  const codeKey = useRef('');
+  const resendAt = useRef(0);
 
-  const isPassword = status === 'awaiting_password';
+  // The worker holds the real state; the modal must never disagree with it. It
+  // also survives a reload this way — reopening the dialog picks the flow back
+  // up wherever it actually is.
+  const settle = (s: SessionState) => {
+    setState(s);
+    if (s.status === 'authorized') {
+      flash('User authorized');
+      onDone();
+      onClose();
+    }
+  };
+  // The poll reaches the current callbacks through a ref, so a parent re-render
+  // does not tear the interval down and restart it.
+  const settleRef = useRef(settle);
+  settleRef.current = settle;
+
+  useEffect(() => {
+    let stop = false;
+    const poll = async () => {
+      try {
+        const s = await api<SessionState>('GET', `/v1/user/${id}`);
+        if (!stop) settleRef.current(s);
+      } catch {
+        // Transient, or the session is gone — keep showing the last state.
+      }
+    };
+    poll();
+    const t = window.setInterval(poll, 2000);
+    return () => {
+      stop = true;
+      window.clearInterval(t);
+    };
+  }, [id]);
+
+  // Anchor the resend countdown the first time each code_info is seen: polling
+  // repeats the same object, and re-reading its timeout would freeze the clock.
+  useEffect(() => {
+    const key = state.code_info ? JSON.stringify(state.code_info) : '';
+    if (key === codeKey.current) return;
+    codeKey.current = key;
+    const t = state.code_info?.timeout;
+    resendAt.current = t ? Date.now() + t * 1000 : 0;
+  }, [state.code_info]);
+
+  useEffect(() => {
+    const tick = () =>
+      setResendIn(Math.max(0, Math.ceil((resendAt.current - Date.now()) / 1000)));
+    tick();
+    const t = window.setInterval(tick, 1000);
+    return () => window.clearInterval(t);
+  }, []);
+
+  const isPassword = state.status === 'awaiting_password';
+  const waiting = state.status === 'awaiting_code' || isPassword;
+  // Typing means the operator is still working on this login, so an armed
+  // "confirm discard" from an earlier click must not stay armed behind it.
+  const onValue = (v: string) => {
+    setValue(v);
+    setConfirmCancel(false);
+  };
+  const nextType = (state.code_info?.next_type?.['@type'] || '').replace(
+    /^authenticationCodeType/,
+    ''
+  );
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     const path = isPassword ? `/v1/user/${id}/login/password` : `/v1/user/${id}/login/code`;
     const body = isPassword ? { password: value } : { code: value.trim() };
     try {
-      let next = '';
+      let next: SessionState | null = null;
       await run(async () => {
-        const res = await api<{ status: string }>('POST', path, body);
-        next = res.status;
+        next = await api<SessionState>('POST', path, body);
       });
-      onDone();
       setValue('');
-      if (next === 'authorized') {
-        flash('User authorized');
-        onClose();
-      } else {
-        setStatus(next); // e.g. awaiting_code -> awaiting_password
-      }
+      onDone();
+      if (next) settle(next);
+    } catch {
+      // Rejected: the login is still standing, so the value can be retyped.
+    }
+  }
+
+  async function resend() {
+    try {
+      await run(async () => {
+        setState(await api<SessionState>('POST', `/v1/user/${id}/login/resend`));
+      });
+      flash('Code resent');
+    } catch {
+      /* inline */
+    }
+  }
+
+  async function cancel() {
+    try {
+      await run(async () => {
+        await api('DELETE', `/v1/user/${id}`);
+      });
+      flash('Login canceled');
+      onDone();
+      onClose();
     } catch {
       /* inline */
     }
@@ -1106,38 +1225,85 @@ function LoginModal({
       <form onSubmit={submit}>
         <div className="hint">
           Session <span className="mono">{id.slice(0, 8)}</span> · status:{' '}
-          <span className={'status-' + status}>{status}</span>
+          <span className={'status-' + state.status}>{state.status}</span>
         </div>
-        {isPassword ? (
-          <label className="field">
-            <span>2FA password</span>
-            <input
-              type="password"
-              value={value}
-              autoFocus
-              onChange={(e) => setValue(e.target.value)}
-            />
-          </label>
-        ) : (
-          <label className="field">
-            <span>Telegram code</span>
-            <input
-              value={value}
-              autoFocus
-              inputMode="numeric"
-              onChange={(e) => setValue(e.target.value)}
-            />
-          </label>
+
+        {waiting && !isPassword && state.code_info && (
+          <div className="hint">{codeDelivery(state.code_info)}</div>
         )}
+
+        {!waiting && (
+          <p>
+            This login is <span className={'status-' + state.status}>{state.status}</span> and
+            no longer accepts input. Start a new login for this number — that asks Telegram for
+            a fresh code.
+          </p>
+        )}
+
+        {waiting &&
+          (isPassword ? (
+            <label className="field">
+              <span>2FA password</span>
+              <input
+                type="password"
+                value={value}
+                autoFocus
+                onChange={(e) => onValue(e.target.value)}
+              />
+            </label>
+          ) : (
+            <label className="field">
+              <span>Telegram code</span>
+              <input
+                value={value}
+                autoFocus
+                inputMode="numeric"
+                onChange={(e) => onValue(e.target.value)}
+              />
+            </label>
+          ))}
+
         {err && <div className="err">{err}</div>}
+        {!err && state.last_error && <div className="err">{state.last_error}</div>}
+
         <div className="modal-actions">
+          {waiting && (
+            <button
+              type="button"
+              className="btn danger"
+              style={{ marginRight: 'auto' }}
+              disabled={busy}
+              onClick={() => (confirmCancel ? cancel() : setConfirmCancel(true))}
+            >
+              {confirmCancel ? 'Confirm — discard login' : 'Cancel login'}
+            </button>
+          )}
           <button type="button" className="btn ghost" onClick={onClose}>
-            Close
+            {waiting ? 'Minimize' : 'Close'}
           </button>
-          <button className="btn" disabled={busy || !value}>
-            {busy ? 'Checking…' : 'Submit'}
-          </button>
+          {waiting && !isPassword && (
+            <button type="button" className="btn ghost" disabled={busy || resendIn > 0} onClick={resend}>
+              {resendIn > 0
+                ? `Resend in ${resendIn}s`
+                : nextType
+                  ? `Resend via ${nextType}`
+                  : 'Resend code'}
+            </button>
+          )}
+          {waiting && (
+            <button className="btn" disabled={busy || !value}>
+              {busy ? 'Checking…' : 'Submit'}
+            </button>
+          )}
         </div>
+
+        {waiting && (
+          <div className="hint" style={{ marginTop: 12, marginBottom: 0 }}>
+            Minimize keeps this login open — reopen it with “Log in” in the sessions list. A
+            wrong code or password can be retyped here; only Cancel throws the attempt away, and
+            a new one costs another Telegram code.
+          </div>
+        )}
       </form>
     </Modal>
   );

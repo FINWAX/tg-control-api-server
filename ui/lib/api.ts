@@ -19,9 +19,14 @@ export function clearToken(): void {
 
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  // Set when the gateway names the object we collided with — a 409 on user
+  // creation points at the login already waiting for input, so the console can
+  // offer to resume it instead of asking Telegram for a second code.
+  sessionId?: string;
+  constructor(message: string, status: number, sessionId?: string) {
     super(message);
     this.status = status;
+    this.sessionId = sessionId;
   }
 }
 
@@ -57,7 +62,7 @@ export async function api<T = unknown>(
   if (!res.ok || (data && data.ok === false)) {
     const msg =
       (data && data.error && data.error.message) || res.statusText || 'Request failed';
-    throw new ApiError(msg, res.status);
+    throw new ApiError(msg, res.status, data?.error?.session_id);
   }
   return (data && 'result' in data ? data.result : data) as T;
 }
@@ -85,6 +90,25 @@ export interface Session {
   app_label?: string;
   proxy_id?: string;
   proxy?: string;
+}
+
+// CodeInfo is td_api authenticationCodeInfo: where Telegram sent the login
+// code, how long it is, what a resend would use, and how many seconds must pass
+// before one is allowed.
+export interface CodeInfo {
+  phone_number?: string;
+  type?: { '@type': string; length?: number };
+  next_type?: { '@type': string } | null;
+  timeout?: number;
+}
+
+// SessionState is the live view of one session, as returned by the status read
+// and by every login step.
+export interface SessionState {
+  id: string;
+  status: string;
+  code_info?: CodeInfo;
+  last_error?: string;
 }
 
 export interface App {
