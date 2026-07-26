@@ -29,23 +29,60 @@ func TestIsBlockedMethod(t *testing.T) {
 	}
 }
 
-func TestPositiveChatID(t *testing.T) {
+func TestNumericChatID(t *testing.T) {
 	cases := []struct {
 		in string
 		id int64
 		ok bool
 	}{
 		{`{"chat_id":123}`, 123, true},
-		{`{"chat_id":-100}`, 0, false}, // channel/group: not force-resolvable
+		{`{"chat_id":-1001234567890}`, -1001234567890, true},
+		{`{"chat_id":-100}`, -100, true},
+		{`{"chat_id":"@durov"}`, 0, false}, // username: resolved elsewhere
 		{`{"chat_id":0}`, 0, false},
 		{`{}`, 0, false},
 		{``, 0, false},
 		{`not json`, 0, false},
 	}
 	for _, c := range cases {
-		id, ok := positiveChatID(json.RawMessage(c.in))
+		id, ok := numericChatID(json.RawMessage(c.in))
 		if id != c.id || ok != c.ok {
-			t.Errorf("positiveChatID(%q) = (%d, %v), want (%d, %v)", c.in, id, ok, c.id, c.ok)
+			t.Errorf("numericChatID(%q) = (%d, %v), want (%d, %v)", c.in, id, ok, c.id, c.ok)
+		}
+	}
+}
+
+// TestForceLoadChat locks the chat_id -> peer-type decoding. A wrong boundary
+// would send a bogus supergroup/basic-group id to TDLib, so each range edge is
+// pinned here.
+func TestForceLoadChat(t *testing.T) {
+	cases := []struct {
+		in         string
+		wantMethod string
+		wantParams string
+		wantOK     bool
+	}{
+		// private chat: chat_id == user id
+		{`{"chat_id":123}`, "createPrivateChat", `{"force":true,"user_id":123}`, true},
+		// supergroup/channel: chat_id == -1000000000000 - supergroup_id
+		{`{"chat_id":-1001234567890}`, "createSupergroupChat", `{"supergroup_id":1234567890}`, true},
+		{`{"chat_id":-1000000000001}`, "createSupergroupChat", `{"supergroup_id":1}`, true},
+		// chanBase itself is still the channel range, not a basic group
+		{`{"chat_id":-1000000000000}`, "createSupergroupChat", `{"supergroup_id":0}`, true},
+		// basic group: chat_id == -basic_group_id
+		{`{"chat_id":-100}`, "createBasicGroupChat", `{"basic_group_id":100}`, true},
+		{`{"chat_id":-999999999999}`, "createBasicGroupChat", `{"basic_group_id":999999999999}`, true},
+		// secret chats are out of scope, not misread as channels
+		{`{"chat_id":-2000000000001}`, "", "", false},
+		// nothing to load
+		{`{"chat_id":"@durov"}`, "", "", false},
+		{`{}`, "", "", false},
+	}
+	for _, c := range cases {
+		m, q, ok := forceLoadChat(json.RawMessage(c.in))
+		if m != c.wantMethod || ok != c.wantOK || (ok && string(q) != c.wantParams) {
+			t.Errorf("forceLoadChat(%q) = (%q, %s, %v), want (%q, %s, %v)",
+				c.in, m, q, ok, c.wantMethod, c.wantParams, c.wantOK)
 		}
 	}
 }

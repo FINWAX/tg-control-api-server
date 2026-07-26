@@ -251,6 +251,23 @@ distinguishing e.g. *Chat not found* from *CHANNEL_PRIVATE* still requires
 matching on `message`. Waits and infrastructure failures, which is where retry
 decisions actually matter, are covered by `retry_after` and `source`.
 
+### Addressing chats
+
+`chat_id` accepts either a username (`"@my_channel"`, resolved via
+`searchPublicChat`) or a numeric id — private chat, basic group, or the familiar
+`-100…` supergroup/channel form.
+
+TDLib lazy-loads dialogs, so a valid numeric id can answer *Chat not found* until
+something materializes the chat object. `/call` handles that for you: on that
+error it decodes the peer type from the id, force-loads the chat
+(`createPrivateChat` / `createBasicGroupChat` / `createSupergroupChat`) and
+retries once. Clients do not need to know the id encoding or warm chats up.
+
+This works when the account already holds the peer's access hash — it is a member
+of the chat, or has seen it. A never-seen **private** channel cannot be reached
+from its numeric id alone (a Telegram protocol constraint); join it, or address a
+public one by `@username`.
+
 ## Sending files
 
 TDLib sends media from a **file on the owning worker's disk** (`inputFileLocal`),

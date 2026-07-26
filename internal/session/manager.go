@@ -779,10 +779,11 @@ func IsBlockedMethod(method string) bool { return blockedMethods[method] }
 // Call runs a dynamic td_api method on an authorized session. Two conveniences
 // wrap the raw dispatch: (1) a string chat_id ("@username") is resolved to its
 // numeric id via searchPublicChat, so callers can address public peers without a
-// manual resolve/access_hash step; (2) a "Chat not found" for a private chat
-// (positive chat_id == user id) force-loads it via createPrivateChat and retries
-// once, since TDLib lazy-loads dialogs. Short FLOOD_WAIT errors are retried
-// transparently; longer ones surface as a structured error.
+// manual resolve/access_hash step; (2) a "Chat not found" force-loads the chat
+// and retries once, since TDLib lazy-loads dialogs — for every peer type, not
+// just private chats (see forceLoadChat), so callers need not know the chat_id
+// encoding. Short FLOOD_WAIT errors are retried transparently; longer ones
+// surface as a structured error.
 func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMessage) (json.RawMessage, error) {
 	ls := m.get(id)
 	if ls == nil {
@@ -807,9 +808,9 @@ func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMe
 
 	res, err := m.sendWithFloodRetry(ctx, cl, method, params)
 	if err != nil && isChatNotFound(err) {
-		if uid, ok := positiveChatID(params); ok {
-			if _, e := tdjson.Call(ctx, cl, "createPrivateChat", privateChatParams(uid)); e == nil {
-				log.Printf("call %s: resolved private chat %d, retrying %s", id, uid, method)
+		if loadMethod, loadParams, ok := forceLoadChat(params); ok {
+			if _, e := tdjson.Call(ctx, cl, loadMethod, loadParams); e == nil {
+				log.Printf("call %s: force-loaded chat via %s, retrying %s", id, loadMethod, method)
 				res, err = m.sendWithFloodRetry(ctx, cl, method, params)
 			}
 		}
@@ -910,25 +911,63 @@ func isChatNotFound(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "Chat not found")
 }
 
-// positiveChatID extracts chat_id from params when it is a private chat (a
-// positive id equal to the peer's user id); groups/channels have negative ids
-// and cannot be force-loaded this way.
-func positiveChatID(params json.RawMessage) (int64, bool) {
+// numericChatID extracts a numeric chat_id from params, or ok=false when it is
+// absent, zero, or a username string (handled by resolveChatUsername).
+func numericChatID(params json.RawMessage) (int64, bool) {
 	if len(params) == 0 {
 		return 0, false
 	}
 	var p struct {
 		ChatID int64 `json:"chat_id"`
 	}
-	if json.Unmarshal(params, &p) != nil || p.ChatID <= 0 {
+	if json.Unmarshal(params, &p) != nil || p.ChatID == 0 {
 		return 0, false
 	}
 	return p.ChatID, true
 }
 
-func privateChatParams(userID int64) json.RawMessage {
-	b, _ := json.Marshal(map[string]any{"user_id": userID, "force": true})
-	return b
+// TDLib packs the peer type into chat_id itself (td::DialogId), the same
+// encoding the Bot API exposes: a positive id is a user, a small negative id is
+// a basic group, and anything at or below chanBase is a supergroup/channel.
+// Secret chats live below secretBase and are not used here (UseSecretChats is
+// off), so they are left unresolved rather than misread as channels.
+const (
+	chanBase   = -1000000000000
+	secretBase = -2000000000000
+)
+
+// forceLoadChat returns the td_api call that makes TDLib materialize a chat it
+// knows of but has not loaded as a dialog yet. TDLib lazy-loads dialogs, so a
+// perfectly valid chat_id can answer "Chat not found" until something creates
+// the chat object; each peer type has its own constructor for that. Returns
+// ok=false for a chat_id whose type cannot be decoded.
+//
+// This only works when the account already holds the peer's access_hash (it is
+// a member, or has seen the chat). A never-seen private channel cannot be
+// resolved from its id alone — that is a Telegram protocol constraint; address
+// it by @username instead.
+func forceLoadChat(params json.RawMessage) (method string, q json.RawMessage, ok bool) {
+	id, ok := numericChatID(params)
+	if !ok {
+		return "", nil, false
+	}
+	var arg map[string]any
+	switch {
+	case id > 0:
+		// force: build from cached user info without a network round-trip.
+		method, arg = "createPrivateChat", map[string]any{"user_id": id, "force": true}
+	case id <= secretBase:
+		return "", nil, false
+	case id <= chanBase:
+		method, arg = "createSupergroupChat", map[string]any{"supergroup_id": chanBase - id}
+	default:
+		method, arg = "createBasicGroupChat", map[string]any{"basic_group_id": -id}
+	}
+	b, err := json.Marshal(arg)
+	if err != nil {
+		return "", nil, false
+	}
+	return method, b, true
 }
 
 // SetWebhook persists the session's webhook subscription and (re)arms live
