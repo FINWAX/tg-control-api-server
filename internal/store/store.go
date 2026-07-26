@@ -680,17 +680,25 @@ func (s *Store) ClaimOrphans(ctx context.Context, workerID string, aliveCutoff t
 	return out, rows.Err()
 }
 
-// SessionRoute returns the advertised address of the worker currently owning
-// the session, or "" if it is unowned or the owner is not alive.
-func (s *Store) SessionRoute(ctx context.Context, sessionID string, aliveCutoff time.Time) (string, error) {
-	var addr string
-	err := s.pool.QueryRow(ctx,
-		`SELECT w.addr FROM session s JOIN worker w ON w.id = s.worker_id
-		 WHERE s.id=$1 AND w.last_seen_at > $2`, sessionID, aliveCutoff).Scan(&addr)
+// SessionRoute returns the session's kind ("user"/"bot") and the advertised
+// address of the worker currently owning it — "" when the session is unowned or
+// its owner is not alive. found is false when no such session exists; the LEFT
+// JOIN keeps those two cases distinct, so a caller can answer 404 for an unknown
+// id and 503 only for a genuinely unhosted one. The kind lets the caller check
+// the {user|bot} path segment against reality without a second query.
+func (s *Store) SessionRoute(ctx context.Context, sessionID string, aliveCutoff time.Time) (kind, addr string, found bool, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT s.kind, COALESCE(w.addr,'')
+		 FROM session s
+		 LEFT JOIN worker w ON w.id = s.worker_id AND w.last_seen_at > $2
+		 WHERE s.id=$1`, sessionID, aliveCutoff).Scan(&kind, &addr)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", nil
+		return "", "", false, nil
 	}
-	return addr, err
+	if err != nil {
+		return "", "", false, err
+	}
+	return kind, addr, true, nil
 }
 
 // ReleaseSessions clears this worker's ownership so peers immediately reclaim

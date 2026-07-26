@@ -275,18 +275,24 @@ func TestOwnershipClaimAndRoute(t *testing.T) {
 		t.Fatalf("second ClaimOrphans should be empty, got %+v", again)
 	}
 
-	// routing resolves to the owner's advertised address
-	addr, err := st.SessionRoute(ctx, sid, cutoff)
-	if err != nil || addr != "http://w1:8080" {
-		t.Fatalf("SessionRoute = (%q, %v)", addr, err)
+	// routing resolves to the owner's advertised address, and reports the kind
+	// so the gateway can validate the {user|bot} path segment
+	kind, addr, found, err := st.SessionRoute(ctx, sid, cutoff)
+	if err != nil || !found || addr != "http://w1:8080" || kind != "user" {
+		t.Fatalf("SessionRoute = (%q, %q, %v, %v)", kind, addr, found, err)
 	}
 
-	// releasing makes it an orphan again
+	// releasing makes it an orphan again: still found, but no live owner
 	if err := st.ReleaseSession(ctx, sid); err != nil {
 		t.Fatalf("ReleaseSession: %v", err)
 	}
-	if addr, _ := st.SessionRoute(ctx, sid, cutoff); addr != "" {
-		t.Fatalf("SessionRoute after release = %q, want empty", addr)
+	if kind, addr, found, _ := st.SessionRoute(ctx, sid, cutoff); addr != "" || !found || kind != "user" {
+		t.Fatalf("SessionRoute after release = (%q, %q, %v), want (user, empty, true)", kind, addr, found)
+	}
+
+	// an unknown id is distinguishable from an unhosted one (404 vs 503)
+	if _, _, found, _ := st.SessionRoute(ctx, "00000000-0000-0000-0000-000000000000", cutoff); found {
+		t.Fatal("SessionRoute for an unknown id should report found=false")
 	}
 }
 

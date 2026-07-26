@@ -228,6 +228,10 @@ Every request except `GET /healthz` must carry `Authorization: Bearer <token>`.
 | `PATCH /v1/{apps\|proxies}/{id}` `{label}` | Rename |
 | `GET/POST/PATCH/DELETE /v1/tokens` | Scoped API token CRUD |
 
+Session-scoped paths carry the session's kind: addressing a `user` session as
+`/v1/bot/{id}` (or the reverse) is a `404`, not a silently accepted call. Use the
+kind reported by `GET /v1/sessions`.
+
 ### Response envelope
 
 Success is `{"ok": true, "result": ...}`. Failure is:

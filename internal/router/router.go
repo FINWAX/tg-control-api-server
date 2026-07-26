@@ -103,10 +103,10 @@ func New(st *store.Store, stale time.Duration, token string, uploads *upload.Sto
 	mux.HandleFunc("GET /v1/bot/{id}", rt.scoped)
 	mux.HandleFunc("GET /v1/user/{id}/files/{file_id}", rt.scoped)
 	mux.HandleFunc("GET /v1/bot/{id}/files/{file_id}", rt.scoped)
-	mux.HandleFunc("DELETE /v1/user/{id}", rt.deleteSession)
-	mux.HandleFunc("DELETE /v1/bot/{id}", rt.deleteSession)
-	mux.HandleFunc("PATCH /v1/user/{id}", rt.updateSession)
-	mux.HandleFunc("PATCH /v1/bot/{id}", rt.updateSession)
+	mux.HandleFunc("DELETE /v1/user/{id}", rt.ownerOrAnyWorker)
+	mux.HandleFunc("DELETE /v1/bot/{id}", rt.ownerOrAnyWorker)
+	mux.HandleFunc("PATCH /v1/user/{id}", rt.ownerOrAnyWorker)
+	mux.HandleFunc("PATCH /v1/bot/{id}", rt.ownerOrAnyWorker)
 
 	return rt.auth(mux)
 }
@@ -389,12 +389,43 @@ func newToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-// scoped forwards to the worker currently owning the path's {id}.
-func (rt *Router) scoped(w http.ResponseWriter, r *http.Request) {
+// pathKind returns the {user|bot} segment of a session-scoped path.
+func pathKind(p string) string {
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	if len(parts) >= 2 && parts[0] == "v1" {
+		return parts[1]
+	}
+	return ""
+}
+
+// resolveSession looks up the path's {id} and enforces that its {user|bot}
+// segment names the session's actual kind — the segment is part of the contract,
+// not decoration, so addressing a user session as a bot is a 404 rather than a
+// silently accepted call. It returns the owning worker's address, which is ""
+// when no live worker currently hosts the session. On failure it has already
+// written the response and returns ok=false.
+func (rt *Router) resolveSession(w http.ResponseWriter, r *http.Request) (addr string, ok bool) {
 	id := r.PathValue("id")
-	addr, err := rt.st.SessionRoute(r.Context(), id, time.Now().Add(-rt.stale))
+	kind, addr, found, err := rt.st.SessionRoute(r.Context(), id, time.Now().Add(-rt.stale))
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
+		return "", false
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return "", false
+	}
+	if want := pathKind(r.URL.Path); kind != want {
+		writeErr(w, http.StatusNotFound, "session "+id+" is a "+kind+", not a "+want)
+		return "", false
+	}
+	return addr, true
+}
+
+// scoped forwards to the worker currently owning the path's {id}.
+func (rt *Router) scoped(w http.ResponseWriter, r *http.Request) {
+	addr, ok := rt.resolveSession(w, r)
+	if !ok {
 		return
 	}
 	if addr == "" {
@@ -404,41 +435,19 @@ func (rt *Router) scoped(w http.ResponseWriter, r *http.Request) {
 	rt.forward(w, r, addr)
 }
 
-// deleteSession routes a session deletion to its owning worker when one is alive
-// (so the live client is closed on the worker actually holding it); otherwise to
-// any live worker, which removes the orphan's registry row and on-disk directory.
-func (rt *Router) deleteSession(w http.ResponseWriter, r *http.Request) {
-	cutoff := time.Now().Add(-rt.stale)
-	addr, err := rt.st.SessionRoute(r.Context(), r.PathValue("id"), cutoff)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+// ownerOrAnyWorker routes a session edit (label/proxy) or deletion to its owning
+// worker when one is alive — so a proxy change lands on the live client and a
+// delete closes the client actually holding it — and otherwise to any live
+// worker, which updates or removes the orphan's registry row (and, for a delete,
+// its on-disk directory).
+func (rt *Router) ownerOrAnyWorker(w http.ResponseWriter, r *http.Request) {
+	addr, ok := rt.resolveSession(w, r)
+	if !ok {
 		return
 	}
 	if addr == "" {
-		if addr, err = rt.st.PickWorker(r.Context(), cutoff); err != nil {
-			writeErr(w, http.StatusBadGateway, err.Error())
-			return
-		}
-	}
-	if addr == "" {
-		writeErr(w, http.StatusServiceUnavailable, "no live workers available")
-		return
-	}
-	rt.forward(w, r, addr)
-}
-
-// updateSession routes a session edit (label/proxy) to its owning worker when
-// alive (so a proxy change is applied on the live client), otherwise to any live
-// worker, which updates only the registry. Same routing as deleteSession.
-func (rt *Router) updateSession(w http.ResponseWriter, r *http.Request) {
-	cutoff := time.Now().Add(-rt.stale)
-	addr, err := rt.st.SessionRoute(r.Context(), r.PathValue("id"), cutoff)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	if addr == "" {
-		if addr, err = rt.st.PickWorker(r.Context(), cutoff); err != nil {
+		var err error
+		if addr, err = rt.st.PickWorker(r.Context(), time.Now().Add(-rt.stale)); err != nil {
 			writeErr(w, http.StatusBadGateway, err.Error())
 			return
 		}

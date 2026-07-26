@@ -45,6 +45,25 @@ func TestSessionTarget(t *testing.T) {
 	}
 }
 
+// TestPathKind locks the {user|bot} segment extraction that resolveSession
+// checks against the stored session kind.
+func TestPathKind(t *testing.T) {
+	cases := map[string]string{
+		"/v1/user/abc":           "user",
+		"/v1/bot/abc/call":       "bot",
+		"/v1/user/abc/files/123": "user",
+		"/v1/sessions":           "sessions",
+		"/healthz":               "",
+		"/v1":                    "",
+		"":                       "",
+	}
+	for path, want := range cases {
+		if got := pathKind(path); got != want {
+			t.Errorf("pathKind(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
 // TestIsFilesPath locks the file-upload routes an enabled scoped token may use.
 func TestIsFilesPath(t *testing.T) {
 	yes := []string{"/v1/files", "/v1/files/abc123", "/v1/files/abc123/complete"}
