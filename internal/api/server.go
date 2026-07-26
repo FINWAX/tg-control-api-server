@@ -38,6 +38,7 @@ func NewServer(st *store.Store, sec *secret.Box, mgr *session.Manager) http.Hand
 	mux.HandleFunc("POST /v1/user", s.handleCreateUser)
 	mux.HandleFunc("POST /v1/user/{id}/login/code", s.handleLoginCode)
 	mux.HandleFunc("POST /v1/user/{id}/login/password", s.handleLoginPassword)
+	mux.HandleFunc("POST /v1/user/{id}/login/resend", s.handleLoginResend)
 	mux.HandleFunc("POST /v1/user/{id}/call", s.handleCall)
 	mux.HandleFunc("POST /v1/bot/{id}/call", s.handleCall)
 	mux.HandleFunc("PUT /v1/user/{id}/updates/webhook", s.handleSetWebhook)
@@ -95,6 +96,34 @@ func writeCallErr(w http.ResponseWriter, err error) {
 		return
 	}
 	writeErr(w, http.StatusBadGateway, err.Error())
+}
+
+// writeLoginErr renders a login failure. A code or password Telegram itself
+// refused comes back as a td_api error with its own code (PHONE_CODE_INVALID,
+// FLOOD_WAIT, …) and the login stays in the same waiting state, so the caller
+// may simply try again; anything else — no such session, wrong state — is a
+// gateway conflict.
+func writeLoginErr(w http.ResponseWriter, err error) {
+	var te *tdjson.Error
+	if errors.As(err, &te) {
+		writeCallErr(w, err)
+		return
+	}
+	writeErr(w, http.StatusConflict, err.Error())
+}
+
+// writeConflict renders a 409 that names the object the caller collided with,
+// so a client can act on it (here: resume the login already in flight) without
+// parsing the message.
+func writeConflict(w http.ResponseWriter, msg, sessionID string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok": false,
+		"error": map[string]any{
+			"message": msg, "source": "gateway", "session_id": sessionID,
+		},
+	})
 }
 
 // httpStatusForTd maps a TDLib error code to an HTTP status. TDLib codes largely
@@ -258,12 +287,26 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "app_id and phone are required")
 		return
 	}
-	id, status, err := s.mgr.CreateUser(r.Context(), req.AppID, req.Phone, req.ProxyID, req.Label)
+	id, state, err := s.mgr.CreateUser(r.Context(), req.AppID, req.Phone, req.ProxyID, req.Label)
 	if err != nil {
+		var pending *session.ErrLoginPending
+		if errors.As(err, &pending) {
+			writeConflict(w, err.Error(), pending.SessionID)
+			return
+		}
 		writeCallErr(w, err)
 		return
 	}
-	writeOK(w, map[string]any{"id": id, "status": status})
+	writeOK(w, sessionBody(id, state))
+}
+
+// sessionBody renders a session's live state under its id — the shape shared by
+// create, login and status reads, so a client parses one thing everywhere.
+func sessionBody(id string, st session.SessionState) any {
+	return struct {
+		ID string `json:"id"`
+		session.SessionState
+	}{id, st}
 }
 
 func (s *Server) handleLoginCode(w http.ResponseWriter, r *http.Request) {
@@ -273,12 +316,13 @@ func (s *Server) handleLoginCode(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	status, err := s.mgr.SubmitCode(r.PathValue("id"), req.Code)
+	id := r.PathValue("id")
+	state, err := s.mgr.SubmitCode(id, req.Code)
 	if err != nil {
-		writeErr(w, http.StatusConflict, err.Error())
+		writeLoginErr(w, err)
 		return
 	}
-	writeOK(w, map[string]any{"status": status})
+	writeOK(w, sessionBody(id, state))
 }
 
 func (s *Server) handleLoginPassword(w http.ResponseWriter, r *http.Request) {
@@ -288,12 +332,25 @@ func (s *Server) handleLoginPassword(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	status, err := s.mgr.SubmitPassword(r.PathValue("id"), req.Password)
+	id := r.PathValue("id")
+	state, err := s.mgr.SubmitPassword(id, req.Password)
 	if err != nil {
-		writeErr(w, http.StatusConflict, err.Error())
+		writeLoginErr(w, err)
 		return
 	}
-	writeOK(w, map[string]any{"status": status})
+	writeOK(w, sessionBody(id, state))
+}
+
+// handleLoginResend re-sends the code on the login already in flight, so a lost
+// SMS costs a resend rather than a whole new login.
+func (s *Server) handleLoginResend(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	state, err := s.mgr.ResendCode(r.Context(), id)
+	if err != nil {
+		writeLoginErr(w, err)
+		return
+	}
+	writeOK(w, sessionBody(id, state))
 }
 
 func (s *Server) handleCall(w http.ResponseWriter, r *http.Request) {
@@ -427,10 +484,10 @@ func (s *Server) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	status, err := s.mgr.Status(id)
+	state, err := s.mgr.State(id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
-	writeOK(w, map[string]any{"id": id, "status": status})
+	writeOK(w, sessionBody(id, state))
 }

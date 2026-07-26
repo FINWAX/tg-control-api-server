@@ -38,8 +38,44 @@ type liveSession struct {
 	hasWH   bool            // a webhook subscription exists -> updates go to the outbox
 	whTypes map[string]bool // allowed update @types; nil = all
 
+	// Interactive login state. The client is stashed while the authorizer is
+	// still driving the login (so a resend can reach it), and loggingIn keeps
+	// everything that expects a usable account away from it until it is done.
+	loggingIn bool
+	codeInfo  json.RawMessage // authenticationCodeInfo of the code TDLib sent
+	lastErr   string          // why the last attempt was rejected, for status reads
+	attempt   chan error      // outcome of the value currently being checked
+	cancel    chan struct{}   // closed to abort a login waiting for input
+	canceled  bool
+	loginDone chan struct{} // closed once the login goroutine has fully unwound
+
+	// persist mirrors a status change into the registry, so a login waiting for
+	// input is visible to every gateway and not only to this process.
+	persist func(string)
+
 	codeCh     chan string
 	passwordCh chan string
+}
+
+// newLiveSession builds the live state for one account, wiring the status
+// mirror to the registry. interactive marks a user login: only those wait for
+// operator input and therefore need a cancel path and a completion signal.
+func (m *Manager) newLiveSession(id, kind string, interactive bool) *liveSession {
+	ls := &liveSession{
+		id: id, kind: kind, status: "connecting",
+		cancel:     make(chan struct{}),
+		codeCh:     make(chan string, 1),
+		passwordCh: make(chan string, 1),
+		persist: func(st string) {
+			if err := m.st.UpdateSessionStatus(context.Background(), id, st); err != nil {
+				log.Printf("session %s: persist status %s: %v", id, st, err)
+			}
+		},
+	}
+	if interactive {
+		ls.loginDone = make(chan struct{})
+	}
+	return ls
 }
 
 // updateHandler queues td_api Update objects for the session's webhook (if
@@ -56,6 +92,15 @@ func (m *Manager) updateHandler(ls *liveSession) client.ResultHandler {
 		// any webhook subscription.
 		if ctor := result.GetConstructor(); ctor == "updateMessageSendSucceeded" || ctor == "updateMessageSendFailed" {
 			m.finishUpload(result)
+		}
+		// A resend produces a new authenticationCodeInfo (different delivery
+		// type, fresh resend timeout) only on the update stream — the request
+		// itself answers with `ok`. Keep the session's copy current so the
+		// operator is told where the new code actually went.
+		if u, ok := result.(*client.UpdateAuthorizationState); ok {
+			if w, ok := u.AuthorizationState.(*client.AuthorizationStateWaitCode); ok {
+				ls.setCodeInfo(w.CodeInfo)
+			}
 		}
 		ls.mu.Lock()
 		on := ls.hasWH
@@ -96,10 +141,22 @@ func typeSet(types []string) map[string]bool {
 	return set
 }
 
+// setStatus records a status change and mirrors it to the registry. The mirror
+// is what makes an interrupted login recoverable: awaiting_code and
+// awaiting_password used to live only in this process, so the session listing
+// (served from Postgres) never showed that an operator's input was expected.
 func (s *liveSession) setStatus(st string) {
 	s.mu.Lock()
+	if s.status == st {
+		s.mu.Unlock()
+		return
+	}
 	s.status = st
+	p := s.persist
 	s.mu.Unlock()
+	if p != nil {
+		p(st)
+	}
 }
 
 func (s *liveSession) status_() string {
@@ -111,14 +168,136 @@ func (s *liveSession) status_() string {
 func (s *liveSession) setClient(cl *client.Client) {
 	s.mu.Lock()
 	s.cl = cl
-	s.status = "authorized"
+	s.loggingIn = false
 	s.mu.Unlock()
+	s.setStatus("authorized")
 }
 
 func (s *liveSession) client() *client.Client {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.cl
+}
+
+// readyClient returns the client only once the account is fully authorized. A
+// login in flight already has a TDLib client (the authorizer stashes it so a
+// resend can reach it), but it is not an account yet: calls, downloads,
+// rebalancing and shutdown handover must all keep off it.
+func (s *liveSession) readyClient() *client.Client {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loggingIn || s.status != "authorized" {
+		return nil
+	}
+	return s.cl
+}
+
+// beginLogin stashes the client TDLib is building while the login still waits
+// for input, and marks the session as not yet usable.
+func (s *liveSession) beginLogin(cl *client.Client) {
+	s.mu.Lock()
+	s.cl = cl
+	s.loggingIn = true
+	s.mu.Unlock()
+}
+
+// failLogin marks a login that never completed. go-tdlib closes the client it
+// was building when the authorizer gives up, so the stashed reference dies with
+// it and must not be closed again.
+func (s *liveSession) failLogin(err error) {
+	s.mu.Lock()
+	s.err = err
+	s.cl = nil
+	s.loggingIn = false
+	if err != nil {
+		s.lastErr = err.Error()
+	}
+	authorized := s.status == "authorized"
+	s.mu.Unlock()
+	if !authorized {
+		s.setStatus("error")
+	}
+}
+
+// armAttempt registers a one-shot channel for the outcome of the code or
+// password about to be submitted, so the caller learns whether Telegram
+// accepted it instead of only seeing whichever status happens to follow.
+func (s *liveSession) armAttempt() chan error {
+	ch := make(chan error, 1)
+	s.mu.Lock()
+	s.attempt = ch
+	s.lastErr = ""
+	s.mu.Unlock()
+	return ch
+}
+
+// reportAttempt publishes the verdict on a checked code or password.
+func (s *liveSession) reportAttempt(err error) {
+	s.mu.Lock()
+	ch := s.attempt
+	s.attempt = nil
+	if err != nil {
+		s.lastErr = err.Error()
+	}
+	s.mu.Unlock()
+	if ch != nil {
+		ch <- err // buffered: never blocks the authorizer
+	}
+}
+
+// setLastErr records why a login failed terminally, so the status read can say
+// more than "error" after the client is gone.
+func (s *liveSession) setLastErr(err error) {
+	s.mu.Lock()
+	s.lastErr = err.Error()
+	s.mu.Unlock()
+}
+
+func (s *liveSession) setCodeInfo(info *client.AuthenticationCodeInfo) {
+	if info == nil {
+		return
+	}
+	b, err := json.Marshal(info)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	s.codeInfo = b
+	s.mu.Unlock()
+}
+
+// abortLogin releases a login that is blocked waiting for a code or password.
+// It reports whether one was actually in flight: if so the authorizer unwinds
+// and closes the client itself, so the caller must not close it a second time.
+func (s *liveSession) abortLogin() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loginDone == nil || s.canceled {
+		return false
+	}
+	select {
+	case <-s.loginDone:
+		return false // already finished on its own
+	default:
+	}
+	s.canceled = true
+	close(s.cancel)
+	return true
+}
+
+// awaitLogin waits for an aborted login goroutine to unwind, bounded, so the
+// caller can remove the session directory without racing a closing client.
+func (s *liveSession) awaitLogin(d time.Duration) {
+	s.mu.Lock()
+	done := s.loginDone
+	s.mu.Unlock()
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+	case <-time.After(d):
+	}
 }
 
 // Manager holds live clients and coordinates their lifecycle. It runs inside a
@@ -157,6 +336,7 @@ const (
 	claimBatch        = 8                // max sessions claimed per reconcile
 	shedPerTick       = 2                // max sessions shed per reconcile
 	openBackoff       = 20 * time.Second // wait this long before retrying a failed open
+	staleLoginGrace   = 2 * time.Minute  // grace before an ownerless login is written off
 )
 
 // flood-wait auto-retry bounds: TDLib FLOOD_WAIT (code 420) asks the caller to
@@ -234,6 +414,16 @@ func (m *Manager) reconcile(ctx context.Context) {
 	}
 	cutoff := time.Now().Add(-workerStale)
 
+	// (0) Reap abandoned logins. A flow waiting for a code lives in the owning
+	// worker's memory, so once that worker is gone nothing can ever deliver the
+	// code: the row must stop advertising that input is expected, or the
+	// console would offer a "log in" that leads nowhere.
+	if n, err := m.st.ExpireStaleLogins(ctx, cutoff, staleLoginGrace); err != nil {
+		log.Printf("reconcile: expire stale logins: %v", err)
+	} else if n > 0 {
+		log.Printf("expired %d abandoned login(s)", n)
+	}
+
 	// (1) Fencing: for sessions the registry now assigns to a live peer, the
 	// active holder wins. If we still hold a working client (e.g. a peer stole
 	// it after our heartbeat merely lapsed), we re-assert ownership — this avoids
@@ -250,7 +440,7 @@ func (m *Manager) reconcile(ctx context.Context) {
 		log.Printf("reconcile: foreign-owned: %v", err)
 	} else {
 		for _, id := range foreign {
-			if ls := m.get(id); ls != nil && ls.client() != nil {
+			if ls := m.get(id); ls != nil && ls.readyClient() != nil {
 				if err := m.st.SetSessionOwner(ctx, id, m.workerID); err != nil {
 					log.Printf("re-assert %s: %v", id, err)
 				} else {
@@ -338,11 +528,16 @@ func (m *Manager) hydrateLogged(ctx context.Context, r store.Rehydratable, okVer
 }
 
 // shed gracefully releases up to n of this worker's sessions so lighter peers
-// reclaim them: close the client (release binlog) then clear ownership.
+// reclaim them: close the client (release binlog) then clear ownership. A login
+// still waiting for input is never shed — no peer could take it over (the flow
+// lives in this process) and handing it away would cost the operator the code.
 func (m *Manager) shed(ctx context.Context, n int) {
 	m.mu.RLock()
 	ids := make([]string, 0, n)
-	for id := range m.live {
+	for id, ls := range m.live {
+		if ls.readyClient() == nil {
+			continue
+		}
 		ids = append(ids, id)
 		if len(ids) == n {
 			break
@@ -351,7 +546,7 @@ func (m *Manager) shed(ctx context.Context, n int) {
 	m.mu.RUnlock()
 	for _, id := range ids {
 		if ls := m.get(id); ls != nil {
-			if cl := ls.client(); cl != nil {
+			if cl := ls.readyClient(); cl != nil {
 				closeClient(ctx, cl)
 			}
 		}
@@ -383,14 +578,24 @@ func (m *Manager) Shutdown(ctx context.Context) {
 
 	// Snapshot live clients, then close each so its binlog lock releases before
 	// a peer opens the same directory. Best-effort with a short per-client bound.
+	// Logins still waiting for input are released rather than closed: the
+	// authorizer owns those clients and closes them as it unwinds.
 	m.mu.RLock()
 	clients := make([]*client.Client, 0, len(m.live))
+	pending := make([]*liveSession, 0)
 	for _, ls := range m.live {
-		if cl := ls.client(); cl != nil {
+		if cl := ls.readyClient(); cl != nil {
 			clients = append(clients, cl)
+		} else {
+			pending = append(pending, ls)
 		}
 	}
 	m.mu.RUnlock()
+	for _, ls := range pending {
+		if ls.abortLogin() {
+			ls.awaitLogin(loginAbortWait)
+		}
+	}
 	var wg sync.WaitGroup
 	for _, cl := range clients {
 		wg.Add(1)
@@ -530,8 +735,7 @@ func (m *Manager) rehydrateOne(ctx context.Context, r store.Rehydratable) error 
 		return err
 	}
 
-	ls := &liveSession{id: r.ID, kind: r.Kind, status: "connecting",
-		codeCh: make(chan string, 1), passwordCh: make(chan string, 1)}
+	ls := m.newLiveSession(r.ID, r.Kind, false)
 	m.put(ls)
 
 	h := &authHandler{
@@ -613,8 +817,7 @@ func (m *Manager) CreateBot(ctx context.Context, appID, token, proxyID, label st
 	_ = m.st.SetSessionDBDir(ctx, id, dbDir)
 	_ = m.st.SetSessionOwner(ctx, id, m.workerID)
 
-	ls := &liveSession{id: id, kind: "bot", status: "connecting",
-		codeCh: make(chan string, 1), passwordCh: make(chan string, 1)}
+	ls := m.newLiveSession(id, "bot", false)
 	m.put(ls)
 
 	h := &authHandler{
@@ -636,57 +839,80 @@ func (m *Manager) CreateBot(ctx context.Context, appID, token, proxyID, label st
 	select {
 	case e := <-done:
 		if e != nil {
-			ls.setStatus("error")
-			_ = m.st.UpdateSessionStatus(ctx, id, "error")
+			ls.failLogin(e)
 			return id, nil, e
 		}
 	case <-time.After(45 * time.Second):
-		ls.setStatus("error")
-		_ = m.st.UpdateSessionStatus(ctx, id, "error")
+		ls.failLogin(errors.New("bot login timeout"))
 		return id, nil, errors.New("bot login timeout")
 	}
 
-	_ = m.st.UpdateSessionStatus(ctx, id, "authorized")
 	me, err = tdjson.Call(ctx, ls.client(), "getMe", nil)
 	return id, me, err
 }
 
+// ErrLoginPending reports that a login for the same phone is already waiting for
+// input. It carries that session's id so the caller can resume the attempt
+// instead of asking Telegram for a second code.
+type ErrLoginPending struct{ SessionID string }
+
+func (e *ErrLoginPending) Error() string {
+	return "a login for this phone is already waiting for input (session " + e.SessionID + ")"
+}
+
+// loginWait bounds how long a submit waits for Telegram before answering with
+// whatever state the login is in; the caller can always read the status again.
+const loginWait = 20 * time.Second
+
+// loginAbortWait bounds how long a delete waits for an aborted login to unwind
+// before removing its directory.
+const loginAbortWait = 10 * time.Second
+
 // CreateUser starts a user login (phone set automatically) and returns as soon
 // as the flow reaches a waiting state. The code/password arrive later via
 // SubmitCode/SubmitPassword.
-func (m *Manager) CreateUser(ctx context.Context, appID, phone, proxyID, label string) (id, status string, err error) {
+//
+// A phone that already has a login waiting for input is refused: every create
+// costs a Telegram code send, and the usual cause is a repeated submit rather
+// than a genuine second account. An authorized number is not refused — one
+// number may legitimately hold several sessions.
+func (m *Manager) CreateUser(ctx context.Context, appID, phone, proxyID, label string) (id string, st SessionState, err error) {
+	if pending, found, e := m.st.PendingUserLogin(ctx, phone); e != nil {
+		return "", st, e
+	} else if found {
+		return "", st, &ErrLoginPending{SessionID: pending}
+	}
 	app, err := m.st.GetApp(ctx, appID)
 	if err != nil {
-		return "", "", fmt.Errorf("app: %w", err)
+		return "", st, fmt.Errorf("app: %w", err)
 	}
 	apiHash, err := m.sec.Decrypt(app.APIHashEnc)
 	if err != nil {
-		return "", "", err
+		return "", st, err
 	}
 	proxyReq, err := m.proxyRequest(ctx, proxyID)
 	if err != nil {
-		return "", "", fmt.Errorf("proxy: %w", err)
+		return "", st, fmt.Errorf("proxy: %w", err)
 	}
 	dbKey := make([]byte, 32)
 	if _, err = rand.Read(dbKey); err != nil {
-		return "", "", err
+		return "", st, err
 	}
 	dbKeyEnc, err := m.sec.Encrypt(dbKey)
 	if err != nil {
-		return "", "", err
+		return "", st, err
 	}
 	id, err = m.st.CreateSession(ctx, store.NewSession{
 		Kind: "user", AppID: appID, ProxyID: proxyID, Phone: phone, DBKeyEnc: dbKeyEnc, Label: label,
 	})
 	if err != nil {
-		return "", "", err
+		return "", st, err
 	}
 	dbDir := filepath.Join(m.dataDir, id)
 	_ = m.st.SetSessionDBDir(ctx, id, dbDir)
 	_ = m.st.SetSessionOwner(ctx, id, m.workerID)
 
-	ls := &liveSession{id: id, kind: "user", status: "connecting",
-		codeCh: make(chan string, 1), passwordCh: make(chan string, 1)}
+	ls := m.newLiveSession(id, "user", true)
 	m.put(ls)
 
 	h := &authHandler{
@@ -697,49 +923,80 @@ func (m *Manager) CreateUser(ctx context.Context, appID, phone, proxyID, label s
 	}
 
 	go func() {
+		defer close(ls.loginDone)
 		cl, e := client.NewClient(h, client.WithResultHandler(m.updateHandler(ls)))
 		if e != nil {
-			ls.mu.Lock()
-			ls.err = e
-			if ls.status != "authorized" {
-				ls.status = "error"
-			}
-			ls.mu.Unlock()
-			_ = m.st.UpdateSessionStatus(context.Background(), id, "error")
+			ls.failLogin(e)
 			return
 		}
 		ls.setClient(cl)
-		_ = m.st.UpdateSessionStatus(context.Background(), id, "authorized")
 	}()
 
-	status = waitLeave(ls, "connecting", 20*time.Second)
-	return id, status, nil
+	waitLeave(ls, "connecting", loginWait)
+	return id, ls.state(), nil
 }
 
-// SubmitCode delivers the login code and waits for the next state.
-func (m *Manager) SubmitCode(id, code string) (string, error) {
-	ls := m.get(id)
-	if ls == nil {
-		return "", errors.New("session not found")
-	}
-	if ls.status_() != "awaiting_code" {
-		return ls.status_(), fmt.Errorf("session is %s, not awaiting_code", ls.status_())
-	}
-	ls.codeCh <- code
-	return waitLeave(ls, "awaiting_code", 20*time.Second), nil
+// SubmitCode delivers the login code and reports the resulting state.
+func (m *Manager) SubmitCode(id, code string) (SessionState, error) {
+	return m.submit(id, "awaiting_code", code, func(ls *liveSession) chan string { return ls.codeCh })
 }
 
-// SubmitPassword delivers the 2FA password and waits for the next state.
-func (m *Manager) SubmitPassword(id, password string) (string, error) {
+// SubmitPassword delivers the 2FA password and reports the resulting state.
+func (m *Manager) SubmitPassword(id, password string) (SessionState, error) {
+	return m.submit(id, "awaiting_password", password, func(ls *liveSession) chan string { return ls.passwordCh })
+}
+
+// submit hands a code or password to the waiting authorizer and reports what
+// Telegram made of it. A rejection is returned as its own error while the login
+// stays in the same waiting state, so the operator can correct a typo without
+// spending a new code — the whole point of the exercise.
+func (m *Manager) submit(id, want, value string, pick func(*liveSession) chan string) (SessionState, error) {
 	ls := m.get(id)
 	if ls == nil {
-		return "", errors.New("session not found")
+		return SessionState{}, errors.New("session not found")
 	}
-	if ls.status_() != "awaiting_password" {
-		return ls.status_(), fmt.Errorf("session is %s, not awaiting_password", ls.status_())
+	if st := ls.status_(); st != want {
+		return ls.state(), fmt.Errorf("session is %s, not %s", st, want)
 	}
-	ls.passwordCh <- password
-	return waitLeave(ls, "awaiting_password", 20*time.Second), nil
+	res := ls.armAttempt()
+	select {
+	case pick(ls) <- value:
+	default:
+		return ls.state(), errors.New("login is not accepting input right now")
+	}
+	select {
+	case err := <-res:
+		if err != nil {
+			return ls.state(), err
+		}
+	case <-time.After(loginWait):
+		return ls.state(), errors.New("timed out waiting for Telegram")
+	}
+	waitLeave(ls, want, loginWait)
+	return ls.state(), nil
+}
+
+// ResendCode asks Telegram to send the login code again on the attempt already
+// in flight. It is the only way to recover a code that never arrived without
+// throwing the login away and paying for a fresh one. Telegram refuses before
+// code_info.timeout has elapsed, and that refusal is surfaced as-is.
+func (m *Manager) ResendCode(ctx context.Context, id string) (SessionState, error) {
+	ls := m.get(id)
+	if ls == nil {
+		return SessionState{}, errors.New("session not found")
+	}
+	if st := ls.status_(); st != "awaiting_code" {
+		return ls.state(), fmt.Errorf("session is %s, not awaiting_code", st)
+	}
+	cl := ls.client()
+	if cl == nil {
+		return ls.state(), errors.New("login is not ready for a resend")
+	}
+	if _, err := tdjson.Call(ctx, cl, "resendAuthenticationCode", nil); err != nil {
+		ls.setLastErr(err)
+		return ls.state(), err
+	}
+	return ls.state(), nil
 }
 
 // blockedMethods are td_api functions the gateway manages itself; callers must
@@ -789,7 +1046,7 @@ func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMe
 	if ls == nil {
 		return nil, errors.New("session not found")
 	}
-	cl := ls.client()
+	cl := ls.readyClient()
 	if cl == nil {
 		return nil, fmt.Errorf("session is %s, not authorized", ls.status_())
 	}
@@ -1093,6 +1350,13 @@ func (m *Manager) applyProxy(ctx context.Context, cl *client.Client, proxyID str
 // when one is alive, so the client closed here is the one actually holding it.
 func (m *Manager) DeleteSession(ctx context.Context, id string) error {
 	if ls := m.get(id); ls != nil {
+		// A login still waiting for a code owns the client. Release it and let
+		// the authorizer close it as it unwinds — closing it here as well would
+		// be a double close, and removing the directory before it has unwound
+		// would pull the disk out from under a live instance.
+		if ls.abortLogin() {
+			ls.awaitLogin(loginAbortWait)
+		}
 		if cl := ls.client(); cl != nil {
 			closeClient(ctx, cl)
 		}
@@ -1115,13 +1379,39 @@ func (m *Manager) DeleteSession(ctx context.Context, id string) error {
 	return nil
 }
 
-// Status returns the current status of a live session.
-func (m *Manager) Status(id string) (string, error) {
+// SessionState is what a status read reports. Beyond the status it carries the
+// login context an operator needs to act: where Telegram sent the code (and how
+// long until it may be resent), and why the last attempt was refused.
+type SessionState struct {
+	Status    string          `json:"status"`
+	CodeInfo  json.RawMessage `json:"code_info,omitempty"`  // td_api authenticationCodeInfo
+	LastError string          `json:"last_error,omitempty"` // last refusal, verbatim
+}
+
+func (s *liveSession) state() SessionState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := SessionState{Status: s.status}
+	switch s.status {
+	case "awaiting_code":
+		st.CodeInfo = s.codeInfo
+		st.LastError = s.lastErr
+	case "authorized":
+		// Nothing is pending and nothing failed: report a clean state rather
+		// than the refusal that preceded the accepted attempt.
+	default:
+		st.LastError = s.lastErr
+	}
+	return st
+}
+
+// State returns the live state of a session held by this worker.
+func (m *Manager) State(id string) (SessionState, error) {
 	ls := m.get(id)
 	if ls == nil {
-		return "", errors.New("session not found")
+		return SessionState{}, errors.New("session not found")
 	}
-	return ls.status_(), nil
+	return ls.state(), nil
 }
 
 // waitLeave polls until the status differs from from, or timeout.

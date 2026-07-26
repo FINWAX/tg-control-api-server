@@ -332,3 +332,104 @@ func TestDeleteSessionCascade(t *testing.T) {
 		t.Fatal("second DeleteSession should be not found")
 	}
 }
+
+func TestPendingUserLogin(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	appID := mkApp(t, st, "main")
+
+	if _, found, err := st.PendingUserLogin(ctx, "+15550000"); err != nil || found {
+		t.Fatalf("PendingUserLogin on an unknown phone = (%v, %v)", found, err)
+	}
+
+	// A fresh session starts in 'connecting', which already counts: creating a
+	// second one for the same number would cost another Telegram code.
+	sid, err := st.CreateSession(ctx, NewSession{
+		Kind: "user", AppID: appID, Phone: "+15550000", DBKeyEnc: []byte("k"),
+	})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if got, found, err := st.PendingUserLogin(ctx, "+15550000"); err != nil || !found || got != sid {
+		t.Fatalf("PendingUserLogin = (%q, %v, %v), want %q", got, found, err, sid)
+	}
+	if err := st.UpdateSessionStatus(ctx, sid, "awaiting_password"); err != nil {
+		t.Fatalf("UpdateSessionStatus: %v", err)
+	}
+	if _, found, _ := st.PendingUserLogin(ctx, "+15550000"); !found {
+		t.Fatal("a session awaiting a password is still an unfinished login")
+	}
+
+	// Once it finishes the number is free again: one number may hold several
+	// sessions, so only an unfinished login blocks a new one.
+	if err := st.UpdateSessionStatus(ctx, sid, "authorized"); err != nil {
+		t.Fatalf("UpdateSessionStatus: %v", err)
+	}
+	if _, found, _ := st.PendingUserLogin(ctx, "+15550000"); found {
+		t.Fatal("an authorized session must not block a new login")
+	}
+
+	// Bots have no phone and must never be picked up here.
+	if _, found, _ := st.PendingUserLogin(ctx, ""); found {
+		t.Fatal("an empty phone must not match")
+	}
+}
+
+func TestExpireStaleLogins(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	cutoff := time.Now().Add(-30 * time.Second)
+	appID := mkApp(t, st, "main")
+
+	mk := func(phone, status, worker string) string {
+		id, err := st.CreateSession(ctx, NewSession{
+			Kind: "user", AppID: appID, Phone: phone, DBKeyEnc: []byte("k"),
+		})
+		if err != nil {
+			t.Fatalf("CreateSession: %v", err)
+		}
+		if err := st.UpdateSessionStatus(ctx, id, status); err != nil {
+			t.Fatalf("UpdateSessionStatus: %v", err)
+		}
+		if worker != "" {
+			if err := st.SetSessionOwner(ctx, id, worker); err != nil {
+				t.Fatalf("SetSessionOwner: %v", err)
+			}
+		}
+		return id
+	}
+
+	if err := st.RegisterWorker(ctx, "live", "http://live:8080"); err != nil {
+		t.Fatalf("RegisterWorker: %v", err)
+	}
+	held := mk("+1", "awaiting_code", "live")  // owner alive: the flow is reachable
+	orphan := mk("+2", "awaiting_code", "")    // nobody can ever deliver the code
+	dead := mk("+3", "awaiting_password", "w0") // owner never registered
+	fine := mk("+4", "authorized", "live")
+
+	// Nothing is old enough yet: a session mid-creation must survive the sweep.
+	if n, err := st.ExpireStaleLogins(ctx, cutoff, time.Hour); err != nil || n != 0 {
+		t.Fatalf("ExpireStaleLogins within grace = (%d, %v), want 0", n, err)
+	}
+
+	n, err := st.ExpireStaleLogins(ctx, cutoff, 0)
+	if err != nil {
+		t.Fatalf("ExpireStaleLogins: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("expired %d logins, want 2 (the ownerless ones)", n)
+	}
+
+	want := map[string]string{
+		held: "awaiting_code", orphan: "expired", dead: "expired", fine: "authorized",
+	}
+	for id, expect := range want {
+		var got string
+		if err := st.pool.QueryRow(ctx, `SELECT status FROM session WHERE id=$1`, id).Scan(&got); err != nil {
+			t.Fatalf("read status: %v", err)
+		}
+		if got != expect {
+			t.Errorf("session %s status = %q, want %q", id, got, expect)
+		}
+	}
+}

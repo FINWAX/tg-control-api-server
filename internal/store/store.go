@@ -172,6 +172,45 @@ func (s *Store) UpdateSessionStatus(ctx context.Context, id, status string) erro
 	return err
 }
 
+// PendingUserLogin returns the id of an unfinished login for this phone — one
+// still connecting or waiting for a code or password. Creating another session
+// for that number would ask Telegram for a second code, so the caller is
+// pointed back at the attempt already in flight. An authorized number is not
+// reported: a number may legitimately hold several sessions.
+func (s *Store) PendingUserLogin(ctx context.Context, phone string) (id string, found bool, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT id::text FROM session
+		 WHERE kind='user' AND phone=$1
+		   AND status IN ('connecting','awaiting_code','awaiting_password')
+		 ORDER BY created_at DESC LIMIT 1`, phone).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return id, true, nil
+}
+
+// ExpireStaleLogins writes off logins whose owning worker is gone. The waiting
+// state (connecting / awaiting_code / awaiting_password) exists only in that
+// worker's memory, so once it is dead no code can ever be delivered and the row
+// would otherwise keep offering a login that cannot be resumed. The grace period
+// covers a session in the middle of being created, before ownership is set.
+func (s *Store) ExpireStaleLogins(ctx context.Context, aliveCutoff time.Time, grace time.Duration) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE session s SET status='expired', updated_at=now()
+		 WHERE s.status IN ('connecting','awaiting_code','awaiting_password')
+		   AND s.updated_at < now() - $2::interval
+		   AND NOT EXISTS (
+		     SELECT 1 FROM worker w WHERE w.id = s.worker_id AND w.last_seen_at >= $1
+		   )`, aliveCutoff, grace)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 // --- management reads (registry listings for the UI / ops) ---
 // These never expose secrets: api_hash, bot tokens, proxy secrets, and db keys
 // are omitted by construction.

@@ -93,6 +93,7 @@ func New(st *store.Store, stale time.Duration, token string, uploads *upload.Sto
 	// Session-scoped: routed to the worker that owns {id}.
 	mux.HandleFunc("POST /v1/user/{id}/login/code", rt.scoped)
 	mux.HandleFunc("POST /v1/user/{id}/login/password", rt.scoped)
+	mux.HandleFunc("POST /v1/user/{id}/login/resend", rt.scoped)
 	mux.HandleFunc("POST /v1/user/{id}/call", rt.scoped)
 	mux.HandleFunc("POST /v1/bot/{id}/call", rt.scoped)
 	mux.HandleFunc("PUT /v1/user/{id}/updates/webhook", rt.scoped)

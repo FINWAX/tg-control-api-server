@@ -28,7 +28,7 @@ func (m *Manager) DownloadFile(ctx context.Context, id, ref, remoteID string) (p
 	if ls == nil {
 		return "", 0, errors.New("session not found")
 	}
-	cl := ls.client()
+	cl := ls.readyClient()
 	if cl == nil {
 		return "", 0, fmt.Errorf("session is %s, not authorized", ls.status_())
 	}
@@ -79,7 +79,7 @@ func (m *Manager) DeleteTdFile(ctx context.Context, id string, fileID int32) {
 	if ls == nil {
 		return
 	}
-	cl := ls.client()
+	cl := ls.readyClient()
 	if cl == nil {
 		return
 	}
