@@ -470,11 +470,15 @@ func writeOK(w http.ResponseWriter, result any) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": result})
 }
 
+// writeErr renders a control-plane failure (auth, routing, no live worker). It
+// is tagged source:"gateway" to match the worker's envelope, so a client can
+// separate infrastructure failures from Telegram's own rejections
+// (source:"tdlib") without matching on the message text.
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"ok":    false,
-		"error": map[string]any{"message": msg},
+		"error": map[string]any{"message": msg, "source": "gateway"},
 	})
 }

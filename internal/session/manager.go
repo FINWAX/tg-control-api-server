@@ -13,7 +13,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -846,19 +845,10 @@ func (m *Manager) sendWithFloodRetry(ctx context.Context, cl *client.Client, met
 // ("Too Many Requests: retry after N"), or ok=false for anything else.
 func floodWaitSeconds(err error) (int, bool) {
 	var te *tdjson.Error
-	if !errors.As(err, &te) || te.Code != 420 {
+	if !errors.As(err, &te) {
 		return 0, false
 	}
-	const marker = "retry after "
-	i := strings.LastIndex(te.Message, marker)
-	if i < 0 {
-		return 0, false
-	}
-	n, perr := strconv.Atoi(strings.TrimSpace(te.Message[i+len(marker):]))
-	if perr != nil || n < 0 {
-		return 0, false
-	}
-	return n, true
+	return te.RetryAfter()
 }
 
 // resolveChatUsername rewrites a string chat_id ("@name" or "name") to the

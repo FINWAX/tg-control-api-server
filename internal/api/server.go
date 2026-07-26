@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/FINWAX/tg-control-api-server/internal/secret"
 	"github.com/FINWAX/tg-control-api-server/internal/session"
@@ -62,29 +63,35 @@ func writeOK(w http.ResponseWriter, result any) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": result})
 }
 
+// writeErr renders a failure that did not come from Telegram — a bad request, a
+// missing session, an unreachable dependency. It is tagged source:"gateway" so a
+// client can tell "our infrastructure said no" (often retryable) from "Telegram
+// said no" (source:"tdlib"), without matching on the message text.
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"ok":    false,
-		"error": map[string]any{"message": msg},
+		"error": map[string]any{"message": msg, "source": "gateway"},
 	})
 }
 
 // writeCallErr renders a td_api dispatch error. A TDLib error becomes a
 // structured envelope ({code, message, source:"tdlib"}) with an HTTP status
-// mapped from the TDLib code; anything else falls back to a 502 string error.
+// mapped from the TDLib code; anything else falls back to a 502 gateway error.
+// A FLOOD_WAIT additionally carries the wait both as error.retry_after and as
+// the standard Retry-After header, so clients need not parse the message.
 func writeCallErr(w http.ResponseWriter, err error) {
 	var te *tdjson.Error
 	if errors.As(err, &te) {
+		body := map[string]any{"code": te.Code, "message": te.Message, "source": "tdlib"}
+		if secs, ok := te.RetryAfter(); ok {
+			body["retry_after"] = secs
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(httpStatusForTd(te.Code))
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok": false,
-			"error": map[string]any{
-				"code": te.Code, "message": te.Message, "source": "tdlib",
-			},
-		})
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": body})
 		return
 	}
 	writeErr(w, http.StatusBadGateway, err.Error())

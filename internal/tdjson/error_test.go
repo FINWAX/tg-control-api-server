@@ -28,3 +28,25 @@ func TestParseTdError(t *testing.T) {
 		t.Errorf("malformed parsed = %+v, want code=0 message=%q", te, "not json")
 	}
 }
+
+func TestErrorRetryAfter(t *testing.T) {
+	cases := []struct {
+		code int
+		msg  string
+		want int
+		ok   bool
+	}{
+		{420, "Too Many Requests: retry after 5", 5, true},
+		{420, "Too Many Requests: retry after 300", 300, true},
+		{420, "no number here", 0, false},
+		{400, "retry after 5", 0, false}, // only FLOOD_WAIT carries a wait
+		{0, "", 0, false},
+	}
+	for _, c := range cases {
+		e := &Error{Code: c.code, Message: c.msg}
+		if got, ok := e.RetryAfter(); got != c.want || ok != c.ok {
+			t.Errorf("(%d, %q).RetryAfter() = (%d, %v), want (%d, %v)",
+				c.code, c.msg, got, ok, c.want, c.ok)
+		}
+	}
+}

@@ -8,6 +8,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/zelenin/go-tdlib/client"
 )
@@ -52,6 +54,27 @@ type Error struct {
 }
 
 func (e *Error) Error() string { return fmt.Sprintf("tdlib %d: %s", e.Code, e.Message) }
+
+// RetryAfter returns the seconds TDLib asks the caller to wait after a
+// FLOOD_WAIT ("Too Many Requests: retry after N", code 420), or ok=false for
+// any other error. The number is only ever carried in the message text, so
+// parsing it here keeps that knowledge with the error type instead of spread
+// across the callers that need to honour or surface the wait.
+func (e *Error) RetryAfter() (int, bool) {
+	if e.Code != 420 {
+		return 0, false
+	}
+	const marker = "retry after "
+	i := strings.LastIndex(e.Message, marker)
+	if i < 0 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(e.Message[i+len(marker):]))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
 
 // parseTdError turns a raw td_api error object into an *Error. If it can't be
 // parsed, Code stays 0 and the raw JSON becomes the message.

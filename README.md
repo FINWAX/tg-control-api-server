@@ -228,8 +228,28 @@ Every request except `GET /healthz` must carry `Authorization: Bearer <token>`.
 | `PATCH /v1/{apps\|proxies}/{id}` `{label}` | Rename |
 | `GET/POST/PATCH/DELETE /v1/tokens` | Scoped API token CRUD |
 
-Responses use an envelope: `{"ok": true, "result": ...}` or
-`{"ok": false, "error": {"message": ...}}`.
+### Response envelope
+
+Success is `{"ok": true, "result": ...}`. Failure is:
+
+```jsonc
+{"ok": false, "error": {
+  "message": "Chat not found",  // human-readable, from TDLib or this service
+  "source": "tdlib",            // "tdlib" = Telegram refused; "gateway" = this service
+  "code": 400,                  // TDLib error code — present only when source is "tdlib"
+  "retry_after": 30             // seconds; only on FLOOD_WAIT (code 420), also sent as Retry-After
+}}
+```
+
+`source` is the field to branch on: `"gateway"` means the request never reached
+Telegram (bad input, unknown session, no live worker) and is often retryable as
+is; `"tdlib"` means Telegram itself rejected it. The HTTP status mirrors `code`
+for TDLib errors, with `420` (FLOOD_WAIT) mapped to `429`.
+
+Note that TDLib packs most refusals into `code: 400` regardless of cause, so
+distinguishing e.g. *Chat not found* from *CHANNEL_PRIVATE* still requires
+matching on `message`. Waits and infrastructure failures, which is where retry
+decisions actually matter, are covered by `retry_after` and `source`.
 
 ## Sending files
 
