@@ -19,6 +19,12 @@ proxies, workers, and scoped API tokens — no curl required. Enable it with the
 
 ![Console dashboard](docs/assets/console-dashboard.png)
 
+The login dialog follows the live state of the session on its worker: a rejected
+code or password can be retyped on the spot, a lost code can be re-sent once its
+timer runs out, and closing the dialog only minimizes it — the session stays in
+`awaiting_code` / `awaiting_password` and **Log in** reopens it from the list,
+including after a reload. See [Recovering a login](#recovering-a-login).
+
 Scoped API tokens grant per-session or per-app access, separate from the master
 token:
 
@@ -142,12 +148,13 @@ A **user** needs the login code (and the 2FA password if set):
 
 ```sh
 curl -s "$G/v1/user" -H "Authorization: Bearer $TOKEN" \
-  -d '{"app_id":"<app_id>","phone":"+1555...","proxy_id":"<proxy_id>"}'       # -> {id, status:awaiting_code}
+  -d '{"app_id":"<app_id>","phone":"+1555...","proxy_id":"<proxy_id>"}'  # -> {id, status:awaiting_code, code_info}
 curl -s "$G/v1/user/<id>/login/code"     -H "Authorization: Bearer $TOKEN" -d '{"code":"12345"}'
 curl -s "$G/v1/user/<id>/login/password" -H "Authorization: Bearer $TOKEN" -d '{"password":"..."}'   # only if 2FA
 ```
 
-Save the session `id` as `$SID`.
+Save the session `id` as `$SID`. See [Recovering a login](#recovering-a-login)
+for what to do when the code is wrong, late, or lost.
 
 **4. Call any td_api method** on the session — the method name is resolved
 dynamically, so the full td_api surface is available:
@@ -212,16 +219,17 @@ Every request except `GET /healthz` must carry `Authorization: Bearer <token>`.
 | `POST /v1/apps` `{api_id, api_hash, label}` | Register a Telegram app → `{app_id}` |
 | `POST /v1/proxies` `{type, host, port, username?, password?, secret?, label?}` | Register a proxy → `{proxy_id}` |
 | `POST /v1/bot` `{token, app_id, proxy_id?, label?}` | Create + log in a bot → `{id, status, me}` |
-| `POST /v1/user` `{app_id, phone, proxy_id?, label?}` | Start a user login → `{id, status}` |
+| `POST /v1/user` `{app_id, phone, proxy_id?, label?}` | Start a user login → `{id, status, code_info}` |
 | `POST /v1/user/{id}/login/code` `{code}` | Submit the login code |
 | `POST /v1/user/{id}/login/password` `{password}` | Submit the 2FA password |
+| `POST /v1/user/{id}/login/resend` | Re-send the code on the same login attempt |
 | `POST /v1/{user\|bot}/{id}/call` `{method, params}` | Async td_api call on the session |
 | `POST /v1/execute` `{method, params}` | Synchronous td_api call (no session) |
 | `POST /v1/files?name=` | Upload a file → `{path}` (single-shot; see [Sending files](#sending-files)) |
 | `PATCH/GET /v1/files/{id}`, `POST /v1/files/{id}/complete`, `DELETE /v1/files/{id}` | Resumable/chunked upload |
 | `GET /v1/{user\|bot}/{id}/files/{file_id}` | Download a file, streamed with Range (see [Downloading files](#downloading-files-crawling)) |
 | `PUT/DELETE /v1/{user\|bot}/{id}/updates/webhook` | Manage update delivery |
-| `GET  /v1/{user\|bot}/{id}` | Session status |
+| `GET  /v1/{user\|bot}/{id}` | Session state → `{id, status, code_info?, last_error?}` |
 | `PATCH /v1/{user\|bot}/{id}` `{label?, proxy_id?}` | Rename / change proxy (applied live) |
 | `DELETE /v1/{user\|bot}/{id}` | Close and remove a session |
 | `GET  /v1/{sessions\|apps\|proxies\|workers}` | Registry listings (no secrets) |
@@ -282,6 +290,56 @@ This works when the account already holds the peer's access hash — it is a mem
 of the chat, or has seen it. A never-seen **private** channel cannot be reached
 from its numeric id alone (a Telegram protocol constraint); join it, or address a
 public one by `@username`.
+
+### Recovering a login
+
+Telegram rations login codes, so a started user login is treated as an asset:
+nothing here throws one away on your behalf.
+
+**A wrong code or password does not end the login.** The submit answers with
+Telegram's own refusal (`source: "tdlib"`, e.g. `PHONE_CODE_INVALID` or
+`PASSWORD_HASH_INVALID`) while the session stays in `awaiting_code` /
+`awaiting_password`. Submit again with the corrected value — the attempt is
+still the same one, and no new code is sent.
+
+**A code that never arrived can be re-sent** on the same attempt:
+
+```sh
+curl -s -X POST "$G/v1/user/$SID/login/resend" -H "Authorization: Bearer $TOKEN"
+```
+
+Telegram refuses a resend until the timeout has elapsed. `code_info` tells you
+when, and where the code went — it is the td_api `authenticationCodeInfo`,
+returned by `POST /v1/user`, by every login step, and by the status read:
+
+```jsonc
+{"@type": "authenticationCodeInfo",
+ "phone_number": "+1555…",
+ "type": {"@type": "authenticationCodeTypeSms", "length": 5},  // where it went
+ "next_type": {"@type": "authenticationCodeTypeCall"},         // what a resend uses
+ "timeout": 60}                                                // seconds until a resend is allowed
+```
+
+**An interrupted client does not lose the login.** `awaiting_code` and
+`awaiting_password` are recorded in the registry, so `GET /v1/sessions` and
+`GET /v1/{user|bot}/{id}` both show that input is expected; resume by submitting
+to the same session id. The status read also carries `last_error`, the reason
+the previous attempt was refused.
+
+**A repeated `POST /v1/user` for a number whose login is still unfinished is
+refused** with `409` rather than costing a second code. The response names the
+attempt to resume:
+
+```jsonc
+{"ok": false, "error": {"message": "a login for this phone is already waiting for input (session …)",
+                        "source": "gateway", "session_id": "…"}}
+```
+
+An *authorized* number is not refused — one number may hold several sessions.
+
+**Giving up is explicit:** `DELETE /v1/user/{id}` closes the pending login and
+removes the session. A login whose worker dies is written off automatically
+(status `expired`), since only that worker could have delivered the code.
 
 ## Sending files
 

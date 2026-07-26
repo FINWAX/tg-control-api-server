@@ -46,8 +46,10 @@ API и шифруются в БД; в .env только инфра-конфиг 
 - `POST /v1/apps` {api_id, api_hash, label} -> {app_id}
 - `POST /v1/proxies` {type, host, port, username?, password?, secret?, label?} -> {proxy_id}
 - `POST /v1/bot` {token, app_id, proxy_id?, label?} -> {id, status, me}
-- `POST /v1/user` {app_id, phone, proxy_id?, label?} -> {id, status}
-- `POST /v1/user/{id}/login/code` {code}; `.../login/password` {password}
+- `POST /v1/user` {app_id, phone, proxy_id?, label?} -> {id, status, code_info?};
+  409 + error.session_id, если по номеру уже идёт незавершённый логин
+- `POST /v1/user/{id}/login/code` {code}; `.../login/password` {password};
+  `.../login/resend` - повтор кода на той же попытке
 - `POST /v1/{user|bot}/{id}/call` {method, params} -> async td_api
 - `POST /v1/execute` {method, params} -> синхронный td_api (без сессии)
 - `POST /v1/files?name=` -> {path} (single-shot); `PATCH/GET /v1/files/{id}`,
@@ -56,7 +58,12 @@ API и шифруются в БД; в .env только инфра-конфиг 
 - `GET /v1/{user|bot}/{id}/files/{file_id}[?remote_id=][&delete=1]` -> стрим файла
   с диска воркера (downloadFile synchronous, http.ServeContent + Range). Для
   краулинга; вход по локальному file_id или постоянному remote_id.
-- `GET /v1/{user|bot}/{id}` -> статус
+- `GET /v1/{user|bot}/{id}` -> {id, status, code_info?, last_error?}
+
+Логин-флоу восстановим: неверный код/пароль не рушит сессию (возвращается ошибка
+tdlib, статус остаётся awaiting_*), awaiting_* пишутся в реестр - вернуться в
+флоу можно по id из `GET /v1/sessions`. Брошенные логины (владелец умер)
+переводятся в expired реконсайлером.
 
 Прокси на сессию поддерживается (addProxy), в локальном случае опционален; смысл -
 чтобы каждый из <50 аккаунтов мог ходить со своего IP. Схема БД версионируется
