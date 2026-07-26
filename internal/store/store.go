@@ -247,16 +247,39 @@ type SessionInfo struct {
 	Proxy      string     `json:"proxy,omitempty"` // "socks5 host:port"
 }
 
+// sessionListSQL is the shared projection behind the session listings; callers
+// append their own WHERE and ORDER BY.
+const sessionListSQL = `SELECT s.id, s.kind, s.status, COALESCE(s.phone,''), COALESCE(s.label,''),
+	        COALESCE(s.worker_id,''), s.last_seen_at, s.created_at,
+	        s.app_id::text, COALESCE(a.label,''),
+	        COALESCE(s.proxy_id::text,''), p.type, p.host, p.port
+	 FROM session s
+	 LEFT JOIN tg_app a ON a.id = s.app_id
+	 LEFT JOIN proxy  p ON p.id = s.proxy_id`
+
 func (s *Store) ListSessions(ctx context.Context) ([]SessionInfo, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT s.id, s.kind, s.status, COALESCE(s.phone,''), COALESCE(s.label,''),
-		        COALESCE(s.worker_id,''), s.last_seen_at, s.created_at,
-		        s.app_id::text, COALESCE(a.label,''),
-		        COALESCE(s.proxy_id::text,''), p.type, p.host, p.port
-		 FROM session s
-		 LEFT JOIN tg_app a ON a.id = s.app_id
-		 LEFT JOIN proxy  p ON p.id = s.proxy_id
-		 ORDER BY s.created_at`)
+	return s.querySessions(ctx, sessionListSQL+` ORDER BY s.created_at`)
+}
+
+// ListSessionsForToken returns only the sessions a scoped token's grants cover,
+// so its holder can discover the full ids (and kinds) it may address without
+// needing the master token. The predicate mirrors TokenGrantsSession — keep the
+// two in step.
+func (s *Store) ListSessionsForToken(ctx context.Context, tokenID string) ([]SessionInfo, error) {
+	return s.querySessions(ctx, sessionListSQL+`
+	 WHERE EXISTS(
+	   SELECT 1 FROM api_token t
+	   WHERE t.id=$1 AND t.enabled AND (
+	     t.all_sessions
+	     OR EXISTS(SELECT 1 FROM api_token_session ts WHERE ts.token_id=t.id AND ts.session_id=s.id)
+	     OR EXISTS(SELECT 1 FROM api_token_app ta WHERE ta.token_id=t.id AND ta.app_id=s.app_id)
+	   )
+	 )
+	 ORDER BY s.created_at`, tokenID)
+}
+
+func (s *Store) querySessions(ctx context.Context, sql string, args ...any) ([]SessionInfo, error) {
+	rows, err := s.pool.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}

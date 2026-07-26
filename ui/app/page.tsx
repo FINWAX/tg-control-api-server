@@ -427,7 +427,9 @@ function SessionsTab(props: {
                     <td>
                       <div>{s.label || <span className="mono">—</span>}</div>
                       {s.phone && <div className="mono">{s.phone}</div>}
-                      <div className="mono">{s.id.slice(0, 8)}</div>
+                      <div>
+                        <CopyID id={s.id} />
+                      </div>
                     </td>
                     <td className={'status-' + s.status}>{s.status}</td>
                     <td>{s.app_label || <span className="mono">{s.app_id.slice(0, 8)}</span>}</td>
@@ -574,7 +576,9 @@ function ProxiesTab({
                     {p.host}:{p.port}
                   </td>
                   <td className="mono">{p.username || '—'}</td>
-                  <td className="mono">{p.id.slice(0, 8)}</td>
+                  <td>
+                    <CopyID id={p.id} />
+                  </td>
                   <td>
                     <div className="row-actions">
                       <button className="btn ghost sm" onClick={() => onRename(p)}>
@@ -1537,6 +1541,31 @@ function TokenModal({
         </div>
       </form>
     </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Click-to-copy id
+// ---------------------------------------------------------------------------
+
+// Tables show ids truncated to stay readable, but every API call needs the whole
+// UUID — so the prefix is a button that copies the full value (also available as
+// the tooltip, for when the clipboard is blocked).
+function CopyID({ id }: { id: string }) {
+  const [copied, setCopied] = useState(false);
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(id);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      /* clipboard blocked; the full id is still in the tooltip */
+    }
+  }
+  return (
+    <button type="button" className="mono copy-id" title={id} onClick={copy}>
+      {copied ? 'copied' : id.slice(0, 8)}
+    </button>
   );
 }
 

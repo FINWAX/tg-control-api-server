@@ -251,6 +251,17 @@ distinguishing e.g. *Chat not found* from *CHANNEL_PRIVATE* still requires
 matching on `message`. Waits and infrastructure failures, which is where retry
 decisions actually matter, are covered by `retry_after` and `source`.
 
+### Choosing `/call` vs `/execute`
+
+`POST /v1/{user|bot}/{id}/call` reaches **every** td_api method — including the
+synchronous ones such as `parseTextEntities`, which work fine on a live session —
+except those the gateway reserves for itself (session lifecycle, authentication,
+proxy, and logging methods; they answer `403`).
+
+`POST /v1/execute` is `td_execute`: local computation with no session and no
+account state, for the ~28 synchronous methods only. Reach for it when no session
+exists yet — otherwise just use `/call`. Both accept scoped tokens.
+
 ### Addressing chats
 
 `chat_id` accepts either a username (`"@my_channel"`, resolved via
@@ -359,12 +370,19 @@ above is preferred for anything but small files.
 The `API_TOKEN` from env is the **master** token: full admin access.
 
 Additional **scoped** tokens can be created (via `/v1/tokens` or the console).
-A scoped token may only invoke a session's `/call` and read its status, and only
-for sessions its scope covers. Scope is the union of:
+A scoped token may invoke a session's `/call`, read its status, and download its
+files — only for sessions its scope covers. Scope is the union of:
 
 - `all_sessions` — every session, or
 - an explicit `session_ids` list, or
 - `app_ids` — all sessions belonging to those apps.
+
+Three routes are open to any enabled token regardless of scope: file uploads
+(`/v1/files*`, which only become sendable through a session's `/call`),
+`/v1/execute` (local computation touching no session), and `GET /v1/sessions`,
+which is **filtered to the token's own grants** — so an integrator can discover
+the full session ids and kinds it may address without being handed the master
+token. Everything else (apps, proxies, tokens, session lifecycle) is master-only.
 
 Each token has an `enabled` flag. Only the SHA-256 of a token's secret is stored;
 the plaintext is shown once at creation.

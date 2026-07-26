@@ -6,6 +6,7 @@
 package router
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -23,6 +24,11 @@ import (
 	"github.com/FINWAX/tg-control-api-server/internal/store"
 	"github.com/FINWAX/tg-control-api-server/internal/upload"
 )
+
+// tokenIDKey tags a request with the authenticated scoped token's id, so a
+// handler can filter its result by that token's grants. Absent on master-token
+// requests, which see everything.
+type tokenIDKey struct{}
 
 type Router struct {
 	st        *store.Store
@@ -151,6 +157,21 @@ func (rt *Router) auth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// /v1/execute is td_execute: pure local computation (parseTextEntities,
+		// getFileMimeType, …) against no session and no account state, so there
+		// is no scope for it to violate. Blocked methods are still refused.
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/execute" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// The session listing is filtered to this token's own grants (see
+		// listSessions), so it reveals nothing the token cannot already address.
+		// It exists so an integrator can discover full session ids and kinds
+		// without being handed the master token.
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/sessions" {
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), tokenIDKey{}, id)))
+			return
+		}
 		sid, ok := sessionTarget(r.Method, r.URL.Path)
 		if !ok {
 			writeErr(w, http.StatusForbidden, "token limited to session calls; management requires the master token")
@@ -210,8 +231,19 @@ func (rt *Router) listProxies(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, items)
 }
 
+// listSessions returns the whole registry for the master token, or — when auth
+// tagged the request with a scoped token — only the sessions that token's grants
+// cover.
 func (rt *Router) listSessions(w http.ResponseWriter, r *http.Request) {
-	items, err := rt.st.ListSessions(r.Context())
+	var (
+		items []store.SessionInfo
+		err   error
+	)
+	if tokenID, scoped := r.Context().Value(tokenIDKey{}).(string); scoped {
+		items, err = rt.st.ListSessionsForToken(r.Context(), tokenID)
+	} else {
+		items, err = rt.st.ListSessions(r.Context())
+	}
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return

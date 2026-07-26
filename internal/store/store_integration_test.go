@@ -145,6 +145,13 @@ func TestTokenScope(t *testing.T) {
 	t4, _ := st.CreateToken(ctx, "off", hash("t4"), false, true, nil, nil)
 	assertGrant(t, st, t4, sA, false)
 
+	// ListSessionsForToken shows exactly what the token may address — it is what
+	// a scoped integrator sees instead of the master-only full registry.
+	assertVisible(t, st, t1, sA)
+	assertVisible(t, st, t2, sA)
+	assertVisible(t, st, t3, sA, sB)
+	assertVisible(t, st, t4) // disabled: sees nothing
+
 	// ResolveToken by hash
 	id, enabled, found, err := st.ResolveToken(ctx, hash("t1"))
 	if err != nil || !found || !enabled || id != t1 {
@@ -174,6 +181,28 @@ func TestTokenScope(t *testing.T) {
 	}
 	if _, _, found, _ := st.ResolveToken(ctx, hash("t1")); found {
 		t.Fatal("token still resolvable after delete")
+	}
+}
+
+// assertVisible checks that ListSessionsForToken returns exactly wantIDs, so the
+// listing filter can never drift wider than TokenGrantsSession.
+func assertVisible(t *testing.T, st *Store, tokenID string, wantIDs ...string) {
+	t.Helper()
+	items, err := st.ListSessionsForToken(context.Background(), tokenID)
+	if err != nil {
+		t.Fatalf("ListSessionsForToken: %v", err)
+	}
+	got := map[string]bool{}
+	for _, s := range items {
+		got[s.ID] = true
+	}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("token %s sees %d sessions, want %d", tokenID, len(got), len(wantIDs))
+	}
+	for _, id := range wantIDs {
+		if !got[id] {
+			t.Errorf("token %s should see session %s", tokenID, id)
+		}
 	}
 }
 
