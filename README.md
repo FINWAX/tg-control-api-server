@@ -285,6 +285,13 @@ curl -sX POST "$G/v1/bot/$SID/call" -H "Authorization: Bearer $TOKEN" -d '{
 3. `GET /v1/files/<upload_id>` → `{offset}` to resume after an interruption
 4. `POST /v1/files/<upload_id>/complete` → `{path}` (verifies the full length)
 
+`PATCH` answers with the **new absolute offset** — the total bytes now on disk,
+not the size of the chunk just sent — as `{"offset": n}` and in an `Upload-Offset`
+response header. Send the next chunk from that value. A `PATCH` whose
+`Upload-Offset` doesn't match the current end of the file is rejected with `409`
+rather than written out of order: re-read `GET /v1/files/<upload_id>` and resume
+from the offset it reports.
+
 **By URL (no upload):** pass `{"@type":"inputFileRemote","id":"https://…"}` as the
 file and TDLib fetches it directly.
 

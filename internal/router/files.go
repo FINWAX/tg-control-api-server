@@ -77,6 +77,10 @@ func (rt *Router) appendChunk(w http.ResponseWriter, r *http.Request) {
 		writeUploadErr(w, err)
 		return
 	}
+	// offset is the new ABSOLUTE write position, not the byte count of this
+	// chunk: send the next chunk from here. Mirrored into the tus-style
+	// Upload-Offset header so a client can resync without reading the body.
+	w.Header().Set("Upload-Offset", strconv.FormatInt(newOffset, 10))
 	writeOK(w, map[string]any{"offset": newOffset})
 }
 
@@ -86,6 +90,7 @@ func (rt *Router) fileStatus(w http.ResponseWriter, r *http.Request) {
 		writeUploadErr(w, err)
 		return
 	}
+	w.Header().Set("Upload-Offset", strconv.FormatInt(offset, 10))
 	writeOK(w, map[string]any{"offset": offset, "length": length})
 }
 
