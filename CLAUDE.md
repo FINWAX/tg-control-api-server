@@ -51,6 +51,8 @@ API и шифруются в БД; в .env только инфра-конфиг 
 - `POST /v1/user/{id}/login/code` {code}; `.../login/password` {password};
   `.../login/resend` - повтор кода на той же попытке
 - `POST /v1/{user|bot}/{id}/call` {method, params} -> async td_api
+- `GET /v1/{user|bot}/{id}/sends?chat_id=&message_id=` -> {status:
+  pending|sent|failed, message_id?, error?}; 404 - неизвестна или старше SEND_TTL
 - `POST /v1/execute` {method, params} -> синхронный td_api (без сессии)
 - `POST /v1/files?name=` -> {path} (single-shot); `PATCH/GET /v1/files/{id}`,
   `POST /v1/files/{id}/complete`, `DELETE /v1/files/{id}` (resumable). Файл для
@@ -64,6 +66,14 @@ API и шифруются в БД; в .env только инфра-конфиг 
 tdlib, статус остаётся awaiting_*), awaiting_* пишутся в реестр - вернуться в
 флоу можно по id из `GET /v1/sessions`. Брошенные логины (владелец умер)
 переводятся в expired реконсайлером.
+
+Отправка асинхронна по природе td_api: `sendMessage` отвечает временным id
+(`sending_state: messageSendingStatePending`), постоянный приходит апдейтом
+updateMessageSendSucceeded. `/call` остаётся честным passthrough и отдаёт ответ
+как есть; соответствие temp->final пишется в таблицу sent_message (ключ
+session_id+chat_id+temp_id: id сообщений уникальны в пределах чата) и читается
+через `/sends`. Апсерт с обеих сторон - регистрация и апдейт гонятся, порядок
+любой. Отложенные сообщения не трекаются. Ретенция - SEND_TTL (по умолчанию 7д).
 
 Прокси на сессию поддерживается (addProxy), в локальном случае опционален; смысл -
 чтобы каждый из <50 аккаунтов мог ходить со своего IP. Схема БД версионируется

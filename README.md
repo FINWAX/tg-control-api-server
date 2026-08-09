@@ -224,6 +224,7 @@ Every request except `GET /healthz` must carry `Authorization: Bearer <token>`.
 | `POST /v1/user/{id}/login/password` `{password}` | Submit the 2FA password |
 | `POST /v1/user/{id}/login/resend` | Re-send the code on the same login attempt |
 | `POST /v1/{user\|bot}/{id}/call` `{method, params}` | Async td_api call on the session |
+| `GET /v1/{user\|bot}/{id}/sends?chat_id=&message_id=` | Resolve a sent message's temporary id (see [Message ids after a send](#message-ids-after-a-send)) |
 | `POST /v1/execute` `{method, params}` | Synchronous td_api call (no session) |
 | `POST /v1/files?name=` | Upload a file → `{path}` (single-shot; see [Sending files](#sending-files)) |
 | `PATCH/GET /v1/files/{id}`, `POST /v1/files/{id}/complete`, `DELETE /v1/files/{id}` | Resumable/chunked upload |
@@ -273,6 +274,56 @@ proxy, and logging methods; they answer `403`).
 `POST /v1/execute` is `td_execute`: local computation with no session and no
 account state, for the ~28 synchronous methods only. Reach for it when no session
 exists yet — otherwise just use `/call`. Both accept scoped tokens.
+
+### Message ids after a send
+
+**The `id` a send returns is temporary.** This is td_api's model, not a quirk of
+this service: `sendMessage` answers as soon as TDLib has queued the message, long
+before Telegram has accepted it, and the id in that answer is local to the
+session. The real, server-assigned id arrives later on the update stream. Nothing
+lasting can be done with the temporary one — you cannot edit, delete, or reply to
+a message by it, and it matches nothing in chat history.
+
+You can tell the two apart without asking: while a message is in flight it
+carries `"sending_state": {"@type": "messageSendingStatePending"}`. Once it has
+landed, `sending_state` is gone.
+
+`/call` stays a faithful td_api passthrough and returns that answer unchanged.
+To learn what the id became, ask:
+
+```sh
+# {"ok":true,"result":{"@type":"message","id":1048576,"chat_id":-1001234567890,
+#                      "sending_state":{"@type":"messageSendingStatePending",...}}}
+curl -s "$G/v1/user/$SID/sends?chat_id=-1001234567890&message_id=1048576" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```jsonc
+{"status": "pending"}                                    // still on its way — poll again
+{"status": "sent",   "chat_id": -1001…, "message_id": 8589934592}  // the durable id
+{"status": "failed", "chat_id": -1001…, "error": {"code": 400, "message": "CHAT_WRITE_FORBIDDEN", "source": "tdlib"}}
+```
+
+A `404` means the send is unknown — a wrong id, or one older than `SEND_TTL`
+(default 7 days). That is deliberately distinct from `pending`, so a client
+never polls forever.
+
+The `failed` branch matters as much as the id: a send that Telegram ultimately
+rejects still answers `200` at `/call`, because at that moment nothing had gone
+wrong yet. Resolving is the only way to learn it never landed without
+subscribing to updates.
+
+How long `pending` lasts is the upload, not the send. A text message resolves in
+well under a second; media resolves only once TDLib has pushed the bytes to
+Telegram, which for a large file is minutes. To keep that out of the polling
+loop, upload first and send second: `preliminaryUploadFile` with your
+`inputFileLocal`, poll `getFile` until `remote.is_uploading_completed`, then
+`sendMessage` with `inputFileId` — all three through `/call`.
+
+Sends are tracked per chat, because td_api message ids are unique within a chat
+rather than globally; that is why `chat_id` is required. Album sends
+(`sendMessageAlbum`) return several messages, each resolved separately.
+Scheduled messages are not tracked: they stay pending until their send time.
 
 ### Addressing chats
 
@@ -432,8 +483,8 @@ above is preferred for anything but small files.
 The `API_TOKEN` from env is the **master** token: full admin access.
 
 Additional **scoped** tokens can be created (via `/v1/tokens` or the console).
-A scoped token may invoke a session's `/call`, read its status, and download its
-files — only for sessions its scope covers. Scope is the union of:
+A scoped token may invoke a session's `/call`, read its status, resolve its sends,
+and download its files — only for sessions its scope covers. Scope is the union of:
 
 - `all_sessions` — every session, or
 - an explicit `session_ids` list, or
