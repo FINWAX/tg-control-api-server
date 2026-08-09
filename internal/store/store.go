@@ -993,3 +993,83 @@ func (s *Store) FailDelivery(ctx context.Context, id string, nextTry time.Time, 
 		`UPDATE webhook_delivery SET attempts=attempts+1, next_try_at=$2 WHERE id=$1`, id, nextTry)
 	return err
 }
+
+// SentMessage is one tracked send. Status is "pending" until the update stream
+// resolves it, then "sent" (FinalID holds the server id) or "failed" (Error
+// holds the rendered td_api error).
+type SentMessage struct {
+	Status  string
+	FinalID int64
+	Error   []byte
+}
+
+// RegisterSend records a dispatched send as pending. The outcome update may be
+// processed before this insert lands, so an existing row always wins: the
+// registration is the weaker fact.
+func (s *Store) RegisterSend(ctx context.Context, sessionID string, chatID, tempID int64) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO sent_message (session_id, chat_id, temp_id, status)
+		 VALUES ($1,$2,$3,'pending')
+		 ON CONFLICT (session_id, chat_id, temp_id) DO NOTHING`,
+		sessionID, chatID, tempID)
+	return err
+}
+
+// RecordSendOutcome upserts a send's terminal state. It neither requires nor
+// preserves a prior pending row, so registration and outcome may arrive in
+// either order. A non-nil tdErr marks the send failed.
+func (s *Store) RecordSendOutcome(ctx context.Context, sessionID string, chatID, tempID, finalID int64, tdErr []byte) error {
+	status := "sent"
+	var e any
+	if len(tdErr) > 0 {
+		status = "failed"
+		e = string(tdErr)
+		finalID = 0
+	}
+	var final any
+	if finalID != 0 {
+		final = finalID
+	}
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO sent_message (session_id, chat_id, temp_id, status, final_id, error)
+		 VALUES ($1,$2,$3,$4,$5,$6)
+		 ON CONFLICT (session_id, chat_id, temp_id) DO UPDATE
+		   SET status=EXCLUDED.status, final_id=EXCLUDED.final_id,
+		       error=EXCLUDED.error, updated_at=now()`,
+		sessionID, chatID, tempID, status, final, e)
+	return err
+}
+
+// GetSend returns a tracked send. found=false means it was never registered
+// (unknown or wrong id) or has already passed retention — which the caller must
+// distinguish from a still-pending send.
+func (s *Store) GetSend(ctx context.Context, sessionID string, chatID, tempID int64) (SentMessage, bool, error) {
+	var m SentMessage
+	var final *int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT status, final_id, error FROM sent_message
+		 WHERE session_id=$1 AND chat_id=$2 AND temp_id=$3`,
+		sessionID, chatID, tempID).Scan(&m.Status, &final, &m.Error)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return SentMessage{}, false, nil
+	}
+	if err != nil {
+		return SentMessage{}, false, err
+	}
+	if final != nil {
+		m.FinalID = *final
+	}
+	return m, true, nil
+}
+
+// PurgeSends removes send-registry rows created before the cutoff, returning
+// how many were deleted. Pending rows go too: a send unresolved for that long
+// is never going to resolve.
+func (s *Store) PurgeSends(ctx context.Context, before time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM sent_message WHERE created_at < $1`, before)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}

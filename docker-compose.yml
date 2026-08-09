@@ -57,6 +57,7 @@ services:
       WORKER_CAPACITY: "200"
       UPLOADS_DIR: /uploads
       UPLOAD_TTL: 2h
+      SEND_TTL: ${SEND_TTL:-168h}
     volumes:
       - tdlibdata:/data
       - uploads:/uploads

@@ -23,6 +23,7 @@ type migration struct {
 // existing data is preserved and upgrades are additive.
 var migrations = []migration{
 	{Version: 1, SQL: schemaV1},
+	{Version: 2, SQL: schemaV2},
 }
 
 // schemaV1 is the baseline: every table from the original unversioned bootstrap,
@@ -114,6 +115,27 @@ CREATE TABLE IF NOT EXISTS api_token_session (
   session_id uuid NOT NULL REFERENCES session(id) ON DELETE CASCADE,
   PRIMARY KEY (token_id, session_id)
 );
+`
+
+// schemaV2 adds the send registry. A send answers with TDLib's temporary
+// message id; the final server id only arrives later, on the update stream. The
+// row records that mapping so a caller can resolve one into the other, and so
+// it survives a worker restart or the session moving between workers. chat_id
+// belongs in the key because TDLib message ids are unique within a chat, not
+// globally — two chats can hand out the same temporary id.
+const schemaV2 = `
+CREATE TABLE IF NOT EXISTS sent_message (
+  session_id uuid   NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+  chat_id    bigint NOT NULL,
+  temp_id    bigint NOT NULL,
+  status     text   NOT NULL CHECK (status IN ('pending','sent','failed')),
+  final_id   bigint,
+  error      jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (session_id, chat_id, temp_id)
+);
+CREATE INDEX IF NOT EXISTS sent_message_created_idx ON sent_message (created_at);
 `
 
 // applyMigrations runs every migration newer than the recorded version, in

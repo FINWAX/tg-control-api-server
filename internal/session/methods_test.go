@@ -165,15 +165,43 @@ func TestGuardLocalPaths(t *testing.T) {
 	}
 }
 
-func TestExtractMessageIDs(t *testing.T) {
-	if ids := extractMessageIDs(json.RawMessage(`{"@type":"message","id":42}`)); len(ids) != 1 || ids[0] != 42 {
-		t.Fatalf("single message ids = %v", ids)
+func TestExtractSentRefs(t *testing.T) {
+	const pending = `"sending_state":{"@type":"messageSendingStatePending","sending_id":0}`
+
+	refs := extractSentRefs(json.RawMessage(`{"@type":"message","id":42,"chat_id":-100,` + pending + `}`))
+	if len(refs) != 1 || refs[0].id != 42 || refs[0].chatID != -100 || !refs[0].pending {
+		t.Fatalf("single message refs = %+v", refs)
 	}
-	if ids := extractMessageIDs(json.RawMessage(`{"@type":"messages","messages":[{"id":1},{"id":2}]}`)); len(ids) != 2 {
-		t.Fatalf("album ids = %v, want 2", ids)
+
+	refs = extractSentRefs(json.RawMessage(
+		`{"@type":"messages","messages":[{"id":1,"chat_id":7,` + pending + `},{"id":2,"chat_id":7,` + pending + `}]}`))
+	if len(refs) != 2 || refs[1].id != 2 || refs[1].chatID != 7 || !refs[1].pending {
+		t.Fatalf("album refs = %+v", refs)
 	}
-	if ids := extractMessageIDs(json.RawMessage(`{"@type":"ok"}`)); len(ids) != 0 {
-		t.Fatalf("non-message ids = %v, want none", ids)
+
+	// Already sent (no sending_state): known, but nothing to resolve later.
+	refs = extractSentRefs(json.RawMessage(`{"@type":"message","id":42,"chat_id":-100}`))
+	if len(refs) != 1 || refs[0].pending {
+		t.Fatalf("settled message refs = %+v, want one non-pending", refs)
+	}
+
+	// Scheduled: TDLib keeps it pending until its send time, which can be days
+	// away — tracking it would just fill the registry with rows nobody resolves.
+	refs = extractSentRefs(json.RawMessage(`{"@type":"message","id":42,"chat_id":-100,` + pending +
+		`,"scheduling_state":{"@type":"messageSchedulingStateSendAtDate","send_date":99}}`))
+	if len(refs) != 1 || refs[0].pending {
+		t.Fatalf("scheduled refs = %+v, want one non-pending", refs)
+	}
+
+	// An explicit null scheduling_state is not a schedule.
+	refs = extractSentRefs(json.RawMessage(`{"@type":"message","id":42,"chat_id":-100,` + pending +
+		`,"scheduling_state":null}`))
+	if len(refs) != 1 || !refs[0].pending {
+		t.Fatalf("null scheduling_state refs = %+v, want one pending", refs)
+	}
+
+	if refs := extractSentRefs(json.RawMessage(`{"@type":"ok"}`)); len(refs) != 0 {
+		t.Fatalf("non-message refs = %+v, want none", refs)
 	}
 }
 

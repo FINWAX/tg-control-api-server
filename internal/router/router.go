@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,6 +68,8 @@ func New(st *store.Store, stale time.Duration, token string, uploads *upload.Sto
 	mux.HandleFunc("GET /v1/proxies", rt.listProxies)
 	mux.HandleFunc("GET /v1/sessions", rt.listSessions)
 	mux.HandleFunc("GET /v1/workers", rt.listWorkers)
+	mux.HandleFunc("GET /v1/user/{id}/sends", rt.getSend)
+	mux.HandleFunc("GET /v1/bot/{id}/sends", rt.getSend)
 
 	// Registry writes served directly by the gateway (rename only; ids immutable).
 	mux.HandleFunc("PATCH /v1/apps/{id}", rt.updateApp)
@@ -209,6 +212,9 @@ func sessionTarget(method, path string) (string, bool) {
 	if method == http.MethodGet && len(parts) == 5 && parts[3] == "files" {
 		return id, true // GET /v1/{kind}/{id}/files/{file_id} — download
 	}
+	if method == http.MethodGet && len(parts) == 4 && parts[3] == "sends" {
+		return id, true // GET /v1/{kind}/{id}/sends — resolve a temporary id
+	}
 	return "", false
 }
 
@@ -259,6 +265,47 @@ func (rt *Router) listWorkers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeOK(w, items)
+}
+
+// getSend resolves the temporary message id a send returned into the final one.
+// td_api answers a send before the message reaches Telegram, so /call can only
+// hand back a temporary id; the owning worker records what it became. This is
+// served from the registry rather than the worker, so it keeps answering across
+// a worker restart or the session moving hosts.
+func (rt *Router) getSend(w http.ResponseWriter, r *http.Request) {
+	if _, ok := rt.resolveSession(w, r); !ok {
+		return
+	}
+	q := r.URL.Query()
+	chatID, err := strconv.ParseInt(q.Get("chat_id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "chat_id must be an integer")
+		return
+	}
+	tempID, err := strconv.ParseInt(q.Get("message_id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "message_id must be an integer")
+		return
+	}
+	rec, found, err := rt.st.GetSend(r.Context(), r.PathValue("id"), chatID, tempID)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	// Absent is not the same as pending: the id may be wrong, or the send may
+	// have aged past SEND_TTL. Saying so stops a client polling forever.
+	if !found {
+		writeErr(w, http.StatusNotFound, "unknown send: never registered, or past SEND_TTL")
+		return
+	}
+	out := map[string]any{"status": rec.Status, "chat_id": chatID}
+	switch {
+	case rec.Status == "sent":
+		out["message_id"] = rec.FinalID
+	case rec.Status == "failed" && len(rec.Error) > 0:
+		out["error"] = json.RawMessage(rec.Error)
+	}
+	writeOK(w, out)
 }
 
 // --- registry write handlers (rename; ids stay immutable) ---

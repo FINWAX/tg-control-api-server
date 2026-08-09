@@ -59,6 +59,11 @@ func (m *Manager) purgeOnce() {
 	} else if w > 0 {
 		log.Printf("retention: purged %d dead workers", w)
 	}
+	if n, err := m.st.PurgeSends(ctx, time.Now().Add(-m.sendTTL)); err != nil {
+		log.Printf("retention: sends: %v", err)
+	} else if n > 0 {
+		log.Printf("retention: purged %d send records", n)
+	}
 	m.sweepUploads()
 }
 

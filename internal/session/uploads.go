@@ -75,40 +75,71 @@ func collectLocalFilePaths(params json.RawMessage) []string {
 // message id (e.g. setProfilePhoto) aren't tracked here — the TTL sweep covers
 // them.
 func (m *Manager) trackUpload(res json.RawMessage, dirs []string) {
-	ids := extractMessageIDs(res)
-	if len(ids) == 0 {
+	refs := extractSentRefs(res)
+	if len(refs) == 0 {
 		return
 	}
 	m.pendMu.Lock()
-	for _, id := range ids {
-		m.pending[id] = dirs
+	for _, r := range refs {
+		m.pending[r.id] = dirs
 	}
 	m.pendMu.Unlock()
 }
 
-// extractMessageIDs pulls temporary message ids from a send result — a single
-// `message` object or a `messages` array (sendMessageAlbum).
-func extractMessageIDs(res json.RawMessage) []int64 {
-	var obj struct {
-		Type     string `json:"@type"`
-		ID       int64  `json:"id"`
-		Messages []struct {
-			ID int64 `json:"id"`
-		} `json:"messages"`
+// sentRef is one message named by a send result: the chat it went to, its
+// temporary id, and whether TDLib is still sending it.
+type sentRef struct {
+	chatID  int64
+	id      int64
+	pending bool
+}
+
+// sendResultMessage is the part of a td_api message a send result exposes. The
+// same shape covers both answers: a single `message` and the `messages` array
+// of sendMessageAlbum.
+type sendResultMessage struct {
+	Type         string `json:"@type"`
+	ID           int64  `json:"id"`
+	ChatID       int64  `json:"chat_id"`
+	SendingState *struct {
+		Type string `json:"@type"`
+	} `json:"sending_state"`
+	SchedulingState *struct {
+		Type string `json:"@type"`
+	} `json:"scheduling_state"`
+	Messages []sendResultMessage `json:"messages"`
+}
+
+// ref reports what the registry needs to know about one message. It counts as
+// still sending only while TDLib says so and the message isn't scheduled — a
+// scheduled message stays pending until its send time, which can be days away.
+func (m sendResultMessage) ref() sentRef {
+	return sentRef{
+		chatID: m.ChatID,
+		id:     m.ID,
+		pending: m.SendingState != nil &&
+			m.SendingState.Type == "messageSendingStatePending" &&
+			m.SchedulingState == nil,
 	}
+}
+
+// extractSentRefs pulls the messages named by a send result — a single
+// `message` object or a `messages` array (sendMessageAlbum).
+func extractSentRefs(res json.RawMessage) []sentRef {
+	var obj sendResultMessage
 	if json.Unmarshal(res, &obj) != nil {
 		return nil
 	}
 	if obj.Type == "message" && obj.ID != 0 {
-		return []int64{obj.ID}
+		return []sentRef{obj.ref()}
 	}
-	var ids []int64
+	var refs []sentRef
 	for _, mm := range obj.Messages {
 		if mm.ID != 0 {
-			ids = append(ids, mm.ID)
+			refs = append(refs, mm.ref())
 		}
 	}
-	return ids
+	return refs
 }
 
 // finishUpload removes the upload dirs tied to a completed send. It reads the

@@ -37,7 +37,7 @@ func reset(t *testing.T, st *Store) {
 	t.Helper()
 	_, err := st.pool.Exec(context.Background(),
 		`TRUNCATE api_token, api_token_app, api_token_session,
-		          webhook_delivery, update_subscription,
+		          webhook_delivery, update_subscription, sent_message,
 		          session, proxy, tg_app, worker RESTART IDENTITY CASCADE`)
 	if err != nil {
 		t.Fatalf("reset: %v", err)
@@ -333,6 +333,95 @@ func TestDeleteSessionCascade(t *testing.T) {
 	}
 }
 
+// TestSendRegistryOrdering is the point of the registry's upsert shape: the
+// worker's registration and TDLib's outcome update race, and either may land
+// first. Whichever order they arrive in, the resolved id must win and survive.
+func TestSendRegistryOrdering(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	appID := mkApp(t, st, "main")
+	sid := mkAuthorizedSession(t, st, appID, "user", "/data/sends")
+
+	// Registration first, outcome second — the ordinary case.
+	if err := st.RegisterSend(ctx, sid, -100, 1); err != nil {
+		t.Fatalf("RegisterSend: %v", err)
+	}
+	if rec, found, err := st.GetSend(ctx, sid, -100, 1); err != nil || !found || rec.Status != "pending" {
+		t.Fatalf("after register = (%+v, %v, %v), want pending", rec, found, err)
+	}
+	if err := st.RecordSendOutcome(ctx, sid, -100, 1, 4096, nil); err != nil {
+		t.Fatalf("RecordSendOutcome: %v", err)
+	}
+	rec, found, err := st.GetSend(ctx, sid, -100, 1)
+	if err != nil || !found || rec.Status != "sent" || rec.FinalID != 4096 {
+		t.Fatalf("after outcome = (%+v, %v, %v), want sent/4096", rec, found, err)
+	}
+
+	// Outcome first, registration second — the race. The late registration must
+	// not knock a resolved send back to pending.
+	if err := st.RecordSendOutcome(ctx, sid, -100, 2, 8192, nil); err != nil {
+		t.Fatalf("RecordSendOutcome (early): %v", err)
+	}
+	if err := st.RegisterSend(ctx, sid, -100, 2); err != nil {
+		t.Fatalf("RegisterSend (late): %v", err)
+	}
+	rec, found, err = st.GetSend(ctx, sid, -100, 2)
+	if err != nil || !found || rec.Status != "sent" || rec.FinalID != 8192 {
+		t.Fatalf("late register = (%+v, %v, %v), want sent/8192", rec, found, err)
+	}
+
+	// A failure carries the error and no final id.
+	if err := st.RecordSendOutcome(ctx, sid, -100, 3, 0, []byte(`{"code":400,"message":"NO","source":"tdlib"}`)); err != nil {
+		t.Fatalf("RecordSendOutcome (failed): %v", err)
+	}
+	rec, found, err = st.GetSend(ctx, sid, -100, 3)
+	if err != nil || !found || rec.Status != "failed" || rec.FinalID != 0 || len(rec.Error) == 0 {
+		t.Fatalf("failed send = (%+v, %v, %v)", rec, found, err)
+	}
+
+	// The same temporary id in another chat is a different send: chat_id is in
+	// the key because TDLib message ids are unique per chat, not globally.
+	if err := st.RegisterSend(ctx, sid, -200, 1); err != nil {
+		t.Fatalf("RegisterSend (other chat): %v", err)
+	}
+	if rec, _, _ := st.GetSend(ctx, sid, -200, 1); rec.Status != "pending" {
+		t.Fatalf("other chat = %+v, want its own pending row", rec)
+	}
+
+	// Unknown ids are absent, not pending.
+	if _, found, err := st.GetSend(ctx, sid, -100, 999); err != nil || found {
+		t.Fatalf("unknown send = (%v, %v), want not found", found, err)
+	}
+}
+
+func TestPurgeSends(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	appID := mkApp(t, st, "main")
+	sid := mkAuthorizedSession(t, st, appID, "user", "/data/purge")
+
+	if err := st.RegisterSend(ctx, sid, -100, 1); err != nil {
+		t.Fatalf("RegisterSend: %v", err)
+	}
+	if err := st.RecordSendOutcome(ctx, sid, -100, 2, 4096, nil); err != nil {
+		t.Fatalf("RecordSendOutcome: %v", err)
+	}
+
+	// Nothing is old enough yet.
+	if n, err := st.PurgeSends(ctx, time.Now().Add(-time.Hour)); err != nil || n != 0 {
+		t.Fatalf("early purge = (%d, %v), want 0", n, err)
+	}
+	// Past the cutoff both go, resolved and pending alike.
+	if n, err := st.PurgeSends(ctx, time.Now().Add(time.Hour)); err != nil || n != 2 {
+		t.Fatalf("purge = (%d, %v), want 2", n, err)
+	}
+	if _, found, _ := st.GetSend(ctx, sid, -100, 2); found {
+		t.Fatal("send survived purge")
+	}
+}
+
 func TestPendingUserLogin(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
@@ -402,8 +491,8 @@ func TestExpireStaleLogins(t *testing.T) {
 	if err := st.RegisterWorker(ctx, "live", "http://live:8080"); err != nil {
 		t.Fatalf("RegisterWorker: %v", err)
 	}
-	held := mk("+1", "awaiting_code", "live")  // owner alive: the flow is reachable
-	orphan := mk("+2", "awaiting_code", "")    // nobody can ever deliver the code
+	held := mk("+1", "awaiting_code", "live")   // owner alive: the flow is reachable
+	orphan := mk("+2", "awaiting_code", "")     // nobody can ever deliver the code
 	dead := mk("+3", "awaiting_password", "w0") // owner never registered
 	fine := mk("+4", "authorized", "live")
 

@@ -87,11 +87,12 @@ func (m *Manager) updateHandler(ls *liveSession) client.ResultHandler {
 		if result.GetType() != client.TypeUpdate {
 			return
 		}
-		// A send that referenced an uploaded file is done once TDLib confirms it:
-		// drop the local upload immediately (success or failure), independent of
-		// any webhook subscription.
+		// A send is done once TDLib confirms it (success or failure), whether or
+		// not a webhook is subscribed: drop the local upload it referenced, and
+		// resolve its temporary message id in the registry.
 		if ctor := result.GetConstructor(); ctor == "updateMessageSendSucceeded" || ctor == "updateMessageSendFailed" {
 			m.finishUpload(result)
+			m.noteSendOutcome(ls.id, result)
 		}
 		// A resend produces a new authenticationCodeInfo (different delivery
 		// type, fresh resend timeout) only on the update stream — the request
@@ -318,6 +319,9 @@ type Manager struct {
 	uploads    *upload.Store // same volume, used only for the TTL sweep
 	uploadTTL  time.Duration // abandoned/sent uploads older than this are swept
 
+	sends   chan sendOutcome // resolved sends awaiting their registry write
+	sendTTL time.Duration    // how long a send stays resolvable
+
 	stopping atomic.Bool // set on graceful shutdown; heartbeat/reconciler stand down
 
 	mu    sync.RWMutex
@@ -347,13 +351,15 @@ const (
 	maxFloodRetries     = 2 // max transparent flood-wait retries per call
 )
 
-func NewManager(st *store.Store, sec *secret.Box, dataDir, workerID, selfAddr string, capacity int, uploadsDir string, uploadTTL time.Duration) *Manager {
+func NewManager(st *store.Store, sec *secret.Box, dataDir, workerID, selfAddr string, capacity int, uploadsDir string, uploadTTL, sendTTL time.Duration) *Manager {
 	m := &Manager{
 		st: st, sec: sec, dataDir: dataDir,
 		workerID: workerID, selfAddr: selfAddr, capacity: capacity,
 		uploadsDir: uploadsDir,
 		uploads:    upload.New(uploadsDir, 0, 0, 0), // sizes irrelevant: workers only sweep
 		uploadTTL:  uploadTTL,
+		sends:      make(chan sendOutcome, sendQueue),
+		sendTTL:    sendTTL,
 		outbox:     make(chan outItem, 1024),
 		live:       map[string]*liveSession{},
 		retry:      map[string]time.Time{},
@@ -365,6 +371,7 @@ func NewManager(st *store.Store, sec *secret.Box, dataDir, workerID, selfAddr st
 	go m.runReconciler()
 	go m.runOutboxWriter()
 	go m.runOutboxDispatcher()
+	go m.runSendWriter()
 	go m.runRetention()
 	return m
 }
@@ -1072,8 +1079,13 @@ func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMe
 			}
 		}
 	}
-	if err == nil && len(uploadDirs) > 0 {
-		m.trackUpload(res, uploadDirs)
+	if err == nil {
+		if len(uploadDirs) > 0 {
+			m.trackUpload(res, uploadDirs)
+		}
+		// The answer carries TDLib's temporary message id and is returned
+		// unchanged; the registry is what lets the caller resolve it later.
+		m.registerSends(ctx, id, res)
 	}
 	return res, err
 }

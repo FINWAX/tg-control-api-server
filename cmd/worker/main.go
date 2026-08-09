@@ -35,6 +35,9 @@ func main() {
 	capacity := envInt("WORKER_CAPACITY", 200)
 	uploadsDir := envOr("UPLOADS_DIR", "/uploads")
 	uploadTTL := envDur("UPLOAD_TTL", 2*time.Hour)
+	// How long a send stays resolvable through /sends. Bounds how late a caller
+	// may still ask what a temporary message id became.
+	sendTTL := envDur("SEND_TTL", 7*24*time.Hour)
 
 	shutdownObs, err := obs.Setup(context.Background(), "tg-control-api-server-worker")
 	if err != nil {
@@ -57,7 +60,7 @@ func main() {
 	workerID := envOr("WORKER_ID", hostname())
 	selfAddr := envOr("WORKER_ADVERTISE", "http://"+advertiseIP()+addr)
 
-	mgr := session.NewManager(st, sec, dataDir, workerID, selfAddr, capacity, uploadsDir, uploadTTL)
+	mgr := session.NewManager(st, sec, dataDir, workerID, selfAddr, capacity, uploadsDir, uploadTTL, sendTTL)
 	httpSrv := &http.Server{Addr: addr, Handler: otelhttp.NewHandler(api.NewServer(st, sec, mgr), "worker")}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
