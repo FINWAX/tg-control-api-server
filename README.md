@@ -373,9 +373,13 @@ There is no gateway endpoint for this — it is a plain td_api question, so ask 
 through `/call`:
 
 - **Ordinary member:** `getChat` → `chat.permissions.can_send_basic_messages`.
+  Careful: `chat.permissions` describes what *ordinary members* may do. In a
+  channel it reads `false` even for an account that can post perfectly well as an
+  administrator, so using it alone gives a false negative — exactly the wrong
+  answer for the common "bot posting to a channel" case.
 - **Administrator (the usual case for a bot in a channel):** `getChatMember` →
-  `status`. Note the parameter is `member_id`, a **MessageSender object**, not a
-  bare `user_id`:
+  `status`, which answers `chatMemberStatusAdministrator`. Note the parameter is
+  `member_id`, a **MessageSender object**, not a bare `user_id`:
 
   ```json
   {"method": "getChatMember", "params": {
@@ -384,8 +388,8 @@ through `/call`:
   }}
   ```
 
-  Passing `user_id` at the top level is silently not the field td_api expects and
-  comes back as *Member not found*.
+  Passing `user_id` at the top level is not the field td_api expects; the call
+  comes back as *Message sender must be non-empty* (or *Member not found*).
 
 Both reads need the chat resolved first, so the same rules as above apply.
 
