@@ -315,10 +315,20 @@ subscribing to updates.
 
 How long `pending` lasts is the upload, not the send. A text message resolves in
 well under a second; media resolves only once TDLib has pushed the bytes to
-Telegram, which for a large file is minutes. To keep that out of the polling
-loop, upload first and send second: `preliminaryUploadFile` with your
-`inputFileLocal`, poll `getFile` until `remote.is_uploading_completed`, then
-`sendMessage` with `inputFileId` — all three through `/call`.
+Telegram, which for a large file can be minutes. Nothing blocks meanwhile —
+`/call` returned immediately — so for most callers the answer is simply to keep
+polling, or to poll less often when the file is big.
+
+Reach for `preliminaryUploadFile` only if you want **upload progress**. If you
+do, note two things the td_api schema is explicit about and that are easy to get
+wrong:
+
+- `priority` is required and must be **1–32**; omitting it fails with *Priority
+  must be between 1 and 32*. `file_type` may be `null`.
+- **Do not wait for `remote.is_uploading_completed`.** By design it stays
+  `false` until the file is actually sent in a message, so waiting on it never
+  finishes. Judge readiness by `remote.uploaded_size` reaching the file size.
+  The file is usable in `inputFileId` well before then.
 
 Sends are tracked per chat, because td_api message ids are unique within a chat
 rather than globally; that is why `chat_id` is required. Album sends
@@ -331,16 +341,53 @@ Scheduled messages are not tracked: they stay pending until their send time.
 `searchPublicChat`) or a numeric id — private chat, basic group, or the familiar
 `-100…` supergroup/channel form.
 
-TDLib lazy-loads dialogs, so a valid numeric id can answer *Chat not found* until
-something materializes the chat object. `/call` handles that for you: on that
-error it decodes the peer type from the id, force-loads the chat
-(`createPrivateChat` / `createBasicGroupChat` / `createSupergroupChat`) and
-retries once. Clients do not need to know the id encoding or warm chats up.
+TDLib lazy-loads dialogs, so a valid numeric id can answer *Chat not found*,
+*Chat info not found* or *CHANNEL_INVALID* until something materializes the chat
+object. `/call` handles all three for you: it decodes the peer type from the id,
+force-loads the chat (`createPrivateChat` / `createBasicGroupChat` /
+`createSupergroupChat`) and retries once. Clients do not need to know the id
+encoding or warm chats up.
 
 This works when the account already holds the peer's access hash — it is a member
-of the chat, or has seen it. A never-seen **private** channel cannot be reached
-from its numeric id alone (a Telegram protocol constraint); join it, or address a
-public one by `@username`.
+of the chat, or has seen it. That knowledge is kept across restarts (TDLib's
+chat-info database is enabled), so a session that could address a chat before a
+restart can still address it after one. A never-seen **private** channel cannot
+be reached from its numeric id alone (a Telegram protocol constraint); join it, or
+address a public one by `@username`.
+
+**Bots are more restricted than user accounts here.** A bot has no dialog list —
+`loadChats` answers *The method is not available to bots* — and an access hash
+cannot be derived from a numeric id. So a bot that has never seen a chat can only
+reach it via `searchPublicChat` on its `@username` (public chats), or after an
+update arrives from that chat. Passing `"@username"` as `chat_id` does this for
+you.
+
+*Not enough rights…* is not retried, because Telegram uses that same message both
+for a genuine permission failure and for a chat whose rights are not loaded yet,
+with nothing machine-readable to tell them apart. If you see it right after a
+restart on a chat that used to work, resolve the chat once by `@username`.
+
+### Checking whether a session may post
+
+There is no gateway endpoint for this — it is a plain td_api question, so ask it
+through `/call`:
+
+- **Ordinary member:** `getChat` → `chat.permissions.can_send_basic_messages`.
+- **Administrator (the usual case for a bot in a channel):** `getChatMember` →
+  `status`. Note the parameter is `member_id`, a **MessageSender object**, not a
+  bare `user_id`:
+
+  ```json
+  {"method": "getChatMember", "params": {
+    "chat_id": -1001234567890,
+    "member_id": {"@type": "messageSenderUser", "user_id": 123456789}
+  }}
+  ```
+
+  Passing `user_id` at the top level is silently not the field td_api expects and
+  comes back as *Member not found*.
+
+Both reads need the chat resolved first, so the same rules as above apply.
 
 ### Recovering a login
 
