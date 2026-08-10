@@ -87,14 +87,28 @@ func TestForceLoadChat(t *testing.T) {
 	}
 }
 
-func TestIsChatNotFound(t *testing.T) {
-	if !isChatNotFound(errors.New("tdlib 400: Chat not found")) {
-		t.Error(`should match "Chat not found"`)
+func TestIsChatUnresolved(t *testing.T) {
+	// The three phrasings TDLib uses for "I haven't materialized this chat".
+	for _, msg := range []string{
+		"tdlib 400: Chat not found",
+		"tdlib 400: Chat info not found",
+		"tdlib 400: CHANNEL_INVALID",
+	} {
+		if !isChatUnresolved(errors.New(msg)) {
+			t.Errorf("should match %q", msg)
+		}
 	}
-	if isChatNotFound(errors.New("tdlib 400: USERNAME_INVALID")) {
-		t.Error("should not match an unrelated error")
+	// A real refusal must not trigger a force-load: "Not enough rights" is
+	// ambiguous by design and retrying it would be guesswork.
+	for _, msg := range []string{
+		"tdlib 400: USERNAME_INVALID",
+		"tdlib 400: Not enough rights to send text messages to the chat",
+	} {
+		if isChatUnresolved(errors.New(msg)) {
+			t.Errorf("should not match %q", msg)
+		}
 	}
-	if isChatNotFound(nil) {
+	if isChatUnresolved(nil) {
 		t.Error("nil should not match")
 	}
 }
