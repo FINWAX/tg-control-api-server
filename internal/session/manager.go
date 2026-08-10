@@ -665,6 +665,14 @@ func (m *Manager) clearRetry(id string) {
 	m.mu.Unlock()
 }
 
+// buildParams is where the storage/footprint trade-off is made. The chat-info
+// database keeps the peer cache — users, groups, supergroups and channels, and
+// with them the access hashes — across restarts. Without it every restart or
+// rebalance left sessions unable to address a chat by numeric id until
+// something re-resolved it: a bot admin of a public channel got CHANNEL_INVALID
+// and "Not enough rights" on a chat it had posted to minutes earlier. The
+// message database stays off — that is the one that actually costs (it caches
+// message history), and nothing here needs it.
 func (m *Manager) buildParams(dbDir string, dbKey []byte, apiID int32, apiHash string) *client.SetTdlibParametersRequest {
 	return &client.SetTdlibParametersRequest{
 		UseTestDc:             false,
@@ -672,7 +680,7 @@ func (m *Manager) buildParams(dbDir string, dbKey []byte, apiID int32, apiHash s
 		FilesDirectory:        filepath.Join(dbDir, "files"),
 		DatabaseEncryptionKey: dbKey,
 		UseFileDatabase:       true,
-		UseChatInfoDatabase:   false,
+		UseChatInfoDatabase:   true,
 		UseMessageDatabase:    false,
 		UseSecretChats:        false,
 		ApiId:                 apiID,
@@ -1071,7 +1079,7 @@ func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMe
 	}
 
 	res, err := m.sendWithFloodRetry(ctx, cl, method, params)
-	if err != nil && isChatNotFound(err) {
+	if err != nil && isChatUnresolved(err) {
 		if loadMethod, loadParams, ok := forceLoadChat(params); ok {
 			if _, e := tdjson.Call(ctx, cl, loadMethod, loadParams); e == nil {
 				log.Printf("call %s: force-loaded chat via %s, retrying %s", id, loadMethod, method)
@@ -1176,8 +1184,25 @@ func stringChatID(params json.RawMessage) (string, bool) {
 	return s, true
 }
 
-func isChatNotFound(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "Chat not found")
+// isChatUnresolved reports whether an error means TDLib has not materialized the
+// chat, as opposed to Telegram genuinely refusing. It has three phrasings for
+// the same condition: "Chat not found" for a dialog it knows of but hasn't
+// loaded, "Chat info not found" when it lacks the chat object, and
+// CHANNEL_INVALID when it holds no access hash for a supergroup or channel. All
+// three are worth one force-load and a retry.
+//
+// "Not enough rights …" is deliberately absent: Telegram sends it both for a
+// real permission failure and for a chat whose rights aren't loaded, and there
+// is no machine-readable way to tell them apart — retrying every genuine
+// refusal would be guesswork.
+func isChatUnresolved(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Chat not found") ||
+		strings.Contains(msg, "Chat info not found") ||
+		strings.Contains(msg, "CHANNEL_INVALID")
 }
 
 // numericChatID extracts a numeric chat_id from params, or ok=false when it is
