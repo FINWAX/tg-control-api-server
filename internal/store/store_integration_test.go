@@ -10,6 +10,7 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
@@ -303,11 +304,9 @@ func TestDeleteSessionCascade(t *testing.T) {
 	appID := mkApp(t, st, "main")
 	sid := mkAuthorizedSession(t, st, appID, "bot", "/data/del")
 
-	if err := st.SetWebhook(ctx, sid, "https://x", []byte("sec"), nil); err != nil {
-		t.Fatalf("SetWebhook: %v", err)
-	}
-	if err := st.EnqueueDelivery(ctx, sid, []byte(`{"a":1}`)); err != nil {
-		t.Fatalf("EnqueueDelivery: %v", err)
+	sub := mkSub(t, st, sid, "", "https://x")
+	if err := st.EnqueueDeliveries(ctx, sid, []string{sub}, []byte(`{"a":1}`)); err != nil {
+		t.Fatalf("EnqueueDeliveries: %v", err)
 	}
 
 	dbDir, found, err := st.DeleteSession(ctx, sid)
@@ -316,8 +315,12 @@ func TestDeleteSessionCascade(t *testing.T) {
 	}
 
 	// subscription and deliveries cascaded away
-	if wh, _ := st.GetWebhook(ctx, sid); wh != nil {
-		t.Fatal("webhook subscription survived session delete")
+	var subs int
+	if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM update_subscription WHERE session_id=$1`, sid).Scan(&subs); err != nil {
+		t.Fatalf("count subscriptions: %v", err)
+	}
+	if subs != 0 {
+		t.Fatal("subscription survived session delete")
 	}
 	var n int
 	if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM webhook_delivery WHERE session_id=$1`, sid).Scan(&n); err != nil {
@@ -520,5 +523,345 @@ func TestExpireStaleLogins(t *testing.T) {
 		if got != expect {
 			t.Errorf("session %s status = %q, want %q", id, got, expect)
 		}
+	}
+}
+
+func mkSub(t *testing.T, st *Store, sessionID, tokenID, url string) string {
+	t.Helper()
+	id, err := st.CreateSubscription(context.Background(), sessionID, tokenID, url, []byte("sec"), nil)
+	if err != nil {
+		t.Fatalf("CreateSubscription: %v", err)
+	}
+	return id
+}
+
+func countRows(t *testing.T, st *Store, sql string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := st.pool.QueryRow(context.Background(), sql, args...).Scan(&n); err != nil {
+		t.Fatalf("count (%s): %v", sql, err)
+	}
+	return n
+}
+
+// TestSubscriptionOwnership: a session takes several subscriptions, and a
+// scoped token sees and removes only its own while the master token sees all.
+func TestSubscriptionOwnership(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	hash := func(s string) []byte { h := sha256.Sum256([]byte(s)); return h[:] }
+
+	appID := mkApp(t, st, "main")
+	sid := mkAuthorizedSession(t, st, appID, "bot", "/data/s")
+	other := mkAuthorizedSession(t, st, appID, "bot", "/data/o")
+	tokA, _ := st.CreateToken(ctx, "a", hash("a"), true, false, nil, []string{sid})
+	tokB, _ := st.CreateToken(ctx, "b", hash("b"), true, false, nil, []string{sid})
+
+	master := mkSub(t, st, sid, "", "https://m")
+	subA := mkSub(t, st, sid, tokA, "https://a")
+	subB := mkSub(t, st, sid, tokB, "https://b")
+
+	all, err := st.ListSubscriptions(ctx, sid, "", "")
+	if err != nil || len(all) != 3 {
+		t.Fatalf("master list = %d subscriptions (%v), want 3", len(all), err)
+	}
+	mine, _ := st.ListSubscriptions(ctx, sid, tokA, "")
+	if len(mine) != 1 || mine[0].ID != subA || mine[0].TokenID == nil || *mine[0].TokenID != tokA {
+		t.Fatalf("token A list = %+v, want only its own", mine)
+	}
+	if one, _ := st.ListSubscriptions(ctx, sid, tokA, subB); len(one) != 0 {
+		t.Fatal("token A could read token B's subscription")
+	}
+	if one, _ := st.ListSubscriptions(ctx, sid, "", master); len(one) != 1 || one[0].TokenID != nil {
+		t.Fatalf("master subscription read = %+v, want one with no owner", one)
+	}
+	if one, _ := st.ListSubscriptions(ctx, other, "", master); len(one) != 0 {
+		t.Fatal("a subscription is readable under another session's path")
+	}
+
+	if found, _ := st.DeleteSubscription(ctx, sid, tokA, subB); found {
+		t.Fatal("token A removed token B's subscription")
+	}
+	if found, _ := st.DeleteSubscription(ctx, sid, tokA, master); found {
+		t.Fatal("token A removed the master's subscription")
+	}
+	if found, _ := st.DeleteSubscription(ctx, sid, tokA, "not-a-uuid"); found {
+		t.Fatal("a malformed id matched something")
+	}
+	if found, err := st.DeleteSubscription(ctx, sid, tokA, subA); err != nil || !found {
+		t.Fatalf("token A removing its own = (%v, %v), want found", found, err)
+	}
+	if found, _ := st.DeleteSubscription(ctx, sid, "", subB); !found {
+		t.Fatal("master could not remove a token's subscription")
+	}
+
+	// Filters round-trip through jsonb, and the worker's view lists them.
+	f, err := st.CreateSubscription(ctx, sid, "", "https://f", nil, []byte(`{"types":["updateNewMessage"],"chats":[-100]}`))
+	if err != nil {
+		t.Fatalf("CreateSubscription with filters: %v", err)
+	}
+	views, err := st.SubscriptionFilters(ctx, []string{sid, other})
+	if err != nil || len(views) != 2 {
+		t.Fatalf("SubscriptionFilters = %d (%v), want 2 (master + filtered)", len(views), err)
+	}
+	var spec struct {
+		Types []string `json:"types"`
+		Chats []int64  `json:"chats"`
+	}
+	if err := json.Unmarshal(views[1].Filters, &spec); err != nil || views[1].ID != f ||
+		len(spec.Types) != 1 || spec.Types[0] != "updateNewMessage" || len(spec.Chats) != 1 || spec.Chats[0] != -100 {
+		t.Fatalf("filters came back as %s (%v)", views[1].Filters, err)
+	}
+	if views[0].Filters != nil {
+		t.Fatalf("an unfiltered subscription reported filters %s", views[0].Filters)
+	}
+
+	// Queueing targets only subscriptions that still exist, on this session.
+	theirs := mkSub(t, st, other, "", "https://t")
+	if err := st.EnqueueDeliveries(ctx, sid, []string{master, subA, theirs}, []byte(`{"x":1}`)); err != nil {
+		t.Fatalf("EnqueueDeliveries: %v", err)
+	}
+	if n := countRows(t, st, `SELECT count(*) FROM webhook_delivery`); n != 1 {
+		t.Fatalf("queued %d rows, want 1 (the removed and the foreign subscription skipped)", n)
+	}
+}
+
+// TestClaimDeliveries covers what decides which rows a worker sends: its own
+// sessions only, a cap per subscription, subscriptions already in flight left
+// out, and a token's access re-checked at every claim.
+func TestClaimDeliveries(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	hash := func(s string) []byte { h := sha256.Sum256([]byte(s)); return h[:] }
+
+	appA := mkApp(t, st, "A")
+	appB := mkApp(t, st, "B")
+	sid := mkAuthorizedSession(t, st, appA, "bot", "/data/a")
+	foreign := mkAuthorizedSession(t, st, appB, "user", "/data/f")
+	for _, w := range []string{"w1", "w2"} {
+		if err := st.RegisterWorker(ctx, w, "http://"+w); err != nil {
+			t.Fatalf("RegisterWorker: %v", err)
+		}
+	}
+	_ = st.SetSessionOwner(ctx, sid, "w1")
+	_ = st.SetSessionOwner(ctx, foreign, "w2")
+
+	tok, _ := st.CreateToken(ctx, "t", hash("t"), true, false, nil, []string{sid})
+	master := mkSub(t, st, sid, "", "https://m")
+	scoped := mkSub(t, st, sid, tok, "https://s")
+	theirs := mkSub(t, st, foreign, "", "https://o")
+	for i := 0; i < 3; i++ {
+		if err := st.EnqueueDeliveries(ctx, sid, []string{master, scoped}, []byte(`{"n":1}`)); err != nil {
+			t.Fatalf("EnqueueDeliveries: %v", err)
+		}
+	}
+	_ = st.EnqueueDeliveries(ctx, foreign, []string{theirs}, []byte(`{"n":2}`))
+
+	claim := func(busy []string, perSub int) map[string]int {
+		t.Helper()
+		ds, err := st.ClaimDeliveries(ctx, "w1", busy, perSub, 100)
+		if err != nil {
+			t.Fatalf("ClaimDeliveries: %v", err)
+		}
+		got := map[string]int{}
+		for _, d := range ds {
+			if d.SessionID != sid || d.Kind != "bot" || d.URL == "" {
+				t.Fatalf("claimed %+v, want a row of w1's bot session with its target", d)
+			}
+			got[d.SubscriptionID]++
+		}
+		return got
+	}
+	same := func(name string, got, want map[string]int) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("%s: claimed %v, want %v", name, got, want)
+		}
+		for k, v := range want {
+			if got[k] != v {
+				t.Fatalf("%s: claimed %v, want %v", name, got, want)
+			}
+		}
+	}
+
+	same("own sessions only", claim(nil, 10), map[string]int{master: 3, scoped: 3})
+	same("capped per subscription", claim(nil, 2), map[string]int{master: 2, scoped: 2})
+	same("busy subscription skipped", claim([]string{master}, 10), map[string]int{scoped: 3})
+
+	off, on := false, true
+	_, _ = st.UpdateToken(ctx, tok, TokenPatch{Enabled: &off})
+	same("disabled token", claim(nil, 10), map[string]int{master: 3})
+	_, _ = st.UpdateToken(ctx, tok, TokenPatch{Enabled: &on})
+
+	none := []string{}
+	_, _ = st.UpdateToken(ctx, tok, TokenPatch{SessionIDs: &none})
+	same("session out of scope", claim(nil, 10), map[string]int{master: 3})
+	apps := []string{appA}
+	_, _ = st.UpdateToken(ctx, tok, TokenPatch{AppIDs: &apps})
+	same("scope back through the app", claim(nil, 10), map[string]int{master: 3, scoped: 3})
+
+	// A deleted token takes its subscription, and what it had queued, along.
+	if found, _ := st.DeleteToken(ctx, tok); !found {
+		t.Fatal("DeleteToken: not found")
+	}
+	if n := countRows(t, st, `SELECT count(*) FROM update_subscription WHERE id=$1`, scoped); n != 0 {
+		t.Fatal("subscription survived its token")
+	}
+	if n := countRows(t, st, `SELECT count(*) FROM webhook_delivery WHERE subscription_id=$1`, scoped); n != 0 {
+		t.Fatalf("%d deliveries survived their subscription", n)
+	}
+}
+
+// TestDeliveryOutcomeStatus: each outcome lands on the row and on the
+// subscription's status, which also counts what is pending, failed and lost.
+func TestDeliveryOutcomeStatus(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	appID := mkApp(t, st, "main")
+	sid := mkAuthorizedSession(t, st, appID, "user", "/data/s")
+	_ = st.RegisterWorker(ctx, "w1", "http://w1")
+	_ = st.SetSessionOwner(ctx, sid, "w1")
+	sub := mkSub(t, st, sid, "", "https://r")
+	sibling := mkSub(t, st, sid, "", "https://r2")
+	for i := 0; i < 3; i++ {
+		_ = st.EnqueueDeliveries(ctx, sid, []string{sub}, []byte(`{"n":1}`))
+	}
+	ds, err := st.ClaimDeliveries(ctx, "w1", nil, 10, 10)
+	if err != nil || len(ds) != 3 {
+		t.Fatalf("ClaimDeliveries = %d rows (%v), want 3", len(ds), err)
+	}
+
+	if err := st.MarkDelivered(ctx, ds[0].ID); err != nil {
+		t.Fatalf("MarkDelivered: %v", err)
+	}
+	if err := st.FailDelivery(ctx, ds[1].ID, time.Now().Add(time.Hour), false, "status 500"); err != nil {
+		t.Fatalf("FailDelivery (retry): %v", err)
+	}
+	if err := st.FailDelivery(ctx, ds[2].ID, time.Time{}, true, "timeout"); err != nil {
+		t.Fatalf("FailDelivery (give up): %v", err)
+	}
+	if err := st.AddDropped(ctx, sid, 4); err != nil {
+		t.Fatalf("AddDropped: %v", err)
+	}
+
+	got, _ := st.ListSubscriptions(ctx, sid, "", sub)
+	if len(got) != 1 {
+		t.Fatalf("subscription not found")
+	}
+	s := got[0]
+	if s.LastDeliveredAt == nil || s.LastError == nil || *s.LastError != "timeout" || s.LastErrorAt == nil {
+		t.Fatalf("status = %+v, want last success and last error 'timeout'", s)
+	}
+	if s.Pending != 1 || s.Failed != 1 || s.Dropped != 4 {
+		t.Fatalf("counts = pending %d failed %d dropped %d, want 1/1/4", s.Pending, s.Failed, s.Dropped)
+	}
+	// A loss happens before routing, so every subscription of the session is charged.
+	if sib, _ := st.ListSubscriptions(ctx, sid, "", sibling); sib[0].Dropped != 4 {
+		t.Fatalf("sibling dropped = %d, want 4", sib[0].Dropped)
+	}
+
+	var attempts int
+	if err := st.pool.QueryRow(ctx, `SELECT attempts FROM webhook_delivery WHERE id=$1`, ds[1].ID).Scan(&attempts); err != nil || attempts != 1 {
+		t.Fatalf("retried row attempts = %d (%v), want 1", attempts, err)
+	}
+	// The retry is scheduled an hour out, the others are done: nothing is due.
+	if again, _ := st.ClaimDeliveries(ctx, "w1", nil, 10, 10); len(again) != 0 {
+		t.Fatalf("claimed %d rows, want none due", len(again))
+	}
+}
+
+// TestPurgeDeliveriesStalePending: rows past retention go whatever their
+// status, so a queue that can no longer be sent does not grow forever.
+func TestPurgeDeliveriesStalePending(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	appID := mkApp(t, st, "main")
+	sid := mkAuthorizedSession(t, st, appID, "bot", "/data/s")
+	sub := mkSub(t, st, sid, "", "https://r")
+	_ = st.EnqueueDeliveries(ctx, sid, []string{sub}, []byte(`{"old":1}`))
+	if _, err := st.pool.Exec(ctx, `UPDATE webhook_delivery SET created_at = now() - interval '48 hours'`); err != nil {
+		t.Fatalf("age row: %v", err)
+	}
+	_ = st.EnqueueDeliveries(ctx, sid, []string{sub}, []byte(`{"new":1}`))
+
+	n, err := st.PurgeDeliveries(ctx, time.Now().Add(-24*time.Hour))
+	if err != nil || n != 1 {
+		t.Fatalf("PurgeDeliveries = (%d, %v), want 1 (the stale pending row)", n, err)
+	}
+	if left := countRows(t, st, `SELECT count(*) FROM webhook_delivery WHERE status='pending'`); left != 1 {
+		t.Fatalf("%d pending rows left, want the fresh one", left)
+	}
+}
+
+// TestMigrationV3Backfill runs the real upgrade path: a database at v2, with a
+// subscription and rows queued the old way, is migrated to v3. Queued rows must
+// land on the subscription they were meant for, rows of a session without one
+// are dropped (nothing could ever send them), and a second subscription per
+// session becomes possible.
+func TestMigrationV3Backfill(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	full := migrations
+	t.Cleanup(func() { migrations = full })
+	migrate := func(upTo int) {
+		t.Helper()
+		migrations = full[:upTo]
+		tx, err := st.pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if err := applyMigrations(ctx, tx); err != nil {
+			t.Fatalf("migrate to %d: %v", upTo, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+	if _, err := st.pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
+		t.Fatalf("reset schema: %v", err)
+	}
+	migrate(2)
+
+	var appID, withSub, withoutSub, legacy string
+	if err := st.pool.QueryRow(ctx,
+		`INSERT INTO tg_app (api_id, api_hash_enc) VALUES (1, 'x') RETURNING id`).Scan(&appID); err != nil {
+		t.Fatalf("seed app: %v", err)
+	}
+	for _, dst := range []*string{&withSub, &withoutSub} {
+		if err := st.pool.QueryRow(ctx,
+			`INSERT INTO session (kind, app_id) VALUES ('bot', $1) RETURNING id`, appID).Scan(dst); err != nil {
+			t.Fatalf("seed session: %v", err)
+		}
+	}
+	if err := st.pool.QueryRow(ctx,
+		`INSERT INTO update_subscription (session_id, url) VALUES ($1, 'https://old') RETURNING id`,
+		withSub).Scan(&legacy); err != nil {
+		t.Fatalf("seed subscription: %v", err)
+	}
+	for _, sess := range []string{withSub, withSub, withoutSub} {
+		if _, err := st.pool.Exec(ctx,
+			`INSERT INTO webhook_delivery (session_id, payload) VALUES ($1, '{}')`, sess); err != nil {
+			t.Fatalf("seed delivery: %v", err)
+		}
+	}
+
+	migrate(len(full))
+
+	if n := countRows(t, st, `SELECT count(*) FROM webhook_delivery WHERE subscription_id=$1`, legacy); n != 2 {
+		t.Fatalf("%d queued rows attributed to the legacy subscription, want 2", n)
+	}
+	if n := countRows(t, st, `SELECT count(*) FROM webhook_delivery`); n != 2 {
+		t.Fatalf("%d rows after backfill, want 2 (the subscription-less one dropped)", n)
+	}
+	subs, err := st.ListSubscriptions(ctx, withSub, "", "")
+	if err != nil || len(subs) != 1 || subs[0].TokenID != nil || subs[0].Pending != 2 || subs[0].Dropped != 0 {
+		t.Fatalf("legacy subscription after upgrade = %+v (%v), want master-owned with 2 pending", subs, err)
+	}
+	if _, err := st.CreateSubscription(ctx, withSub, "", "https://second", nil, nil); err != nil {
+		t.Fatalf("second subscription on one session refused: %v", err)
 	}
 }

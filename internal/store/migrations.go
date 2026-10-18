@@ -24,6 +24,7 @@ type migration struct {
 var migrations = []migration{
 	{Version: 1, SQL: schemaV1},
 	{Version: 2, SQL: schemaV2},
+	{Version: 3, SQL: schemaV3},
 }
 
 // schemaV1 is the baseline: every table from the original unversioned bootstrap,
@@ -136,6 +137,32 @@ CREATE TABLE IF NOT EXISTS sent_message (
   PRIMARY KEY (session_id, chat_id, temp_id)
 );
 CREATE INDEX IF NOT EXISTS sent_message_created_idx ON sent_message (created_at);
+`
+
+// schemaV3 lets a session carry many update subscriptions, each owned by the
+// scoped token that created it (NULL: the master token). A delivery row used to
+// find its target by joining the session's single subscription at send time;
+// with several subscriptions that join would multiply rows that share one
+// status, so each row now names its subscription and the fan-out happens when
+// the update is queued. The backfill is exact: until now a session had at most
+// one subscription, so every queued row maps to it.
+const schemaV3 = `
+ALTER TABLE update_subscription DROP CONSTRAINT IF EXISTS update_subscription_session_id_kind_key;
+ALTER TABLE update_subscription
+  ADD COLUMN token_id          uuid REFERENCES api_token(id) ON DELETE CASCADE,
+  ADD COLUMN dropped           bigint NOT NULL DEFAULT 0,
+  ADD COLUMN last_delivered_at timestamptz,
+  ADD COLUMN last_error        text,
+  ADD COLUMN last_error_at     timestamptz;
+CREATE INDEX IF NOT EXISTS update_subscription_session_idx ON update_subscription (session_id);
+
+ALTER TABLE webhook_delivery
+  ADD COLUMN subscription_id uuid REFERENCES update_subscription(id) ON DELETE CASCADE;
+UPDATE webhook_delivery d SET subscription_id = s.id
+  FROM update_subscription s WHERE s.session_id = d.session_id;
+DELETE FROM webhook_delivery WHERE subscription_id IS NULL;
+ALTER TABLE webhook_delivery ALTER COLUMN subscription_id SET NOT NULL;
+CREATE INDEX IF NOT EXISTS webhook_delivery_sub_idx ON webhook_delivery (subscription_id, status);
 `
 
 // applyMigrations runs every migration newer than the recorded version, in

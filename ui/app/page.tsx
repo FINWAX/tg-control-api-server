@@ -12,6 +12,7 @@ import {
   type Proxy,
   type Session,
   type SessionState,
+  type Subscription,
   type Token,
   type Worker,
 } from '../lib/api';
@@ -454,7 +455,7 @@ function SessionsTab(props: {
                           Edit
                         </button>
                         <button className="btn ghost sm" onClick={() => onWebhook(s)}>
-                          Webhook
+                          Webhooks
                         </button>
                         <button className="btn danger sm" onClick={() => onDelete(s)}>
                           Delete
@@ -1431,7 +1432,7 @@ function RenameModal({
 }
 
 // ---------------------------------------------------------------------------
-// Webhook set / clear
+// Webhooks: a session's update subscriptions — list, add, remove
 // ---------------------------------------------------------------------------
 
 function WebhookModal({
@@ -1445,59 +1446,137 @@ function WebhookModal({
   onDone: () => void;
   flash: Flash;
 }) {
+  const [subs, setSubs] = useState<Subscription[] | null>(null);
   const [url, setUrl] = useState('');
   const [secret, setSecret] = useState('');
   const [types, setTypes] = useState('');
+  const [chats, setChats] = useState('');
+  const [issued, setIssued] = useState(''); // a server-generated secret, shown once
   const { busy, err, run } = useSubmit();
-  const base = `/v1/${session.kind}/${session.id}`;
+  const base = `/v1/${session.kind}/${session.id}/updates/subscriptions`;
 
-  async function save(e: React.FormEvent) {
-    e.preventDefault();
-    const filterTypes = types
+  const load = useCallback(async () => {
+    try {
+      setSubs(await api<Subscription[]>('GET', base));
+    } catch (e) {
+      setSubs([]);
+      flash(e instanceof ApiError ? e.message : 'Error', true);
+    }
+  }, [base, flash]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const items = (s: string) =>
+    s
       .split(',')
       .map((t) => t.trim())
       .filter(Boolean);
+
+  async function add(e: React.FormEvent) {
+    e.preventDefault();
     try {
       await run(async () => {
-        await api('PUT', `${base}/updates/webhook`, {
+        const chatIds = items(chats).map(Number);
+        if (chatIds.some((n) => !Number.isSafeInteger(n))) {
+          throw new ApiError('Chat ids must be integers', 400);
+        }
+        const res = await api<{ id: string; secret?: string }>('POST', base, {
           url: url.trim(),
           secret,
-          filters: { types: filterTypes },
+          filters: { types: items(types), chats: chatIds },
         });
+        setIssued(res.secret || '');
       });
-      flash('Webhook saved');
+      setUrl('');
+      setSecret('');
+      setTypes('');
+      setChats('');
+      flash('Subscription added');
+      load();
       onDone();
-      onClose();
     } catch {
       /* inline */
     }
   }
 
-  async function remove() {
+  async function remove(id: string) {
     try {
       await run(async () => {
-        await api('DELETE', `${base}/updates/webhook`);
+        await api('DELETE', `${base}/${id}`);
       });
-      flash('Webhook removed');
+      flash('Subscription removed');
+      load();
       onDone();
-      onClose();
     } catch {
       /* inline */
     }
   }
 
+  const filterText = (s: Subscription) =>
+    [
+      s.filters?.types?.length ? s.filters.types.join(', ') : '',
+      s.filters?.chats?.length ? 'chats ' + s.filters.chats.join(', ') : '',
+    ]
+      .filter(Boolean)
+      .join(' · ') || 'all updates';
+
   return (
-    <Modal title="Session webhook" onClose={onClose}>
-      <form onSubmit={save}>
-        <div className="hint">
-          {session.kind} · <span className="mono">{session.id.slice(0, 8)}</span>
-        </div>
+    <Modal title="Session webhooks" onClose={onClose}>
+      <div className="hint">
+        {session.kind} · <span className="mono">{session.id.slice(0, 8)}</span>
+      </div>
+      {subs === null ? (
+        <div className="hint">Loading…</div>
+      ) : subs.length === 0 ? (
+        <div className="hint">No subscriptions.</div>
+      ) : (
+        <table>
+          <thead>
+            <tr>
+              <th>Receiver</th>
+              <th>Delivery</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {subs.map((s) => (
+              <tr key={s.id}>
+                <td>
+                  <div className="mono">{s.url}</div>
+                  <div className="hint">
+                    <CopyID id={s.id} /> · {s.token_id ? 'token' : 'master'} · {filterText(s)}
+                  </div>
+                </td>
+                <td>
+                  {s.pending} pending · {s.failed} failed
+                  {s.dropped > 0 && <> · {s.dropped} lost</>}
+                  {s.last_error && <div className="err">{s.last_error}</div>}
+                </td>
+                <td>
+                  <button className="btn danger sm" onClick={() => remove(s.id)} disabled={busy}>
+                    Remove
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {issued && (
+        <>
+          <p className="hint">Secret of the new subscription — shown only once:</p>
+          <div className="secret">{issued}</div>
+        </>
+      )}
+      <form onSubmit={add}>
         <label className="field">
           <span>Receiver URL</span>
           <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://…" />
         </label>
         <label className="field">
-          <span>Secret (for HMAC signature)</span>
+          <span>Secret for the HMAC signature (empty = generate one)</span>
           <input value={secret} onChange={(e) => setSecret(e.target.value)} />
         </label>
         <label className="field">
@@ -1508,17 +1587,18 @@ function WebhookModal({
             placeholder="updateNewMessage, updateMessageSendSucceeded"
           />
         </label>
+        <label className="field">
+          <span>Filter chat ids, comma-separated (empty = all)</span>
+          <input value={chats} onChange={(e) => setChats(e.target.value)} placeholder="-1001234567890" />
+        </label>
         {err && <div className="err">{err}</div>}
         <div className="modal-actions">
-          <button type="button" className="btn danger" onClick={remove} disabled={busy}>
-            Remove
-          </button>
           <div style={{ flex: 1 }} />
           <button type="button" className="btn ghost" onClick={onClose}>
-            Cancel
+            Close
           </button>
           <button className="btn" disabled={busy || !url}>
-            {busy ? 'Saving…' : 'Save'}
+            {busy ? 'Adding…' : 'Add'}
           </button>
         </div>
       </form>

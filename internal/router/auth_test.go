@@ -1,6 +1,11 @@
 package router
 
-import "testing"
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
 
 // TestSessionTarget locks down which routes a scoped (non-master) token may use.
 // This is security-critical: anything returning ok=false is master-only, so a
@@ -11,7 +16,8 @@ func TestSessionTarget(t *testing.T) {
 		wantID       string
 		wantOK       bool
 	}{
-		// allowed: a session's /call, status read, file download, send resolve
+		// allowed: a session's /call, status read, file download, send resolve,
+		// update subscriptions
 		{"GET", "/v1/user/abc", "abc", true},
 		{"GET", "/v1/bot/xyz", "xyz", true},
 		{"POST", "/v1/user/abc/call", "abc", true},
@@ -20,6 +26,10 @@ func TestSessionTarget(t *testing.T) {
 		{"GET", "/v1/bot/xyz/files/123", "xyz", true},
 		{"GET", "/v1/user/abc/sends", "abc", true},
 		{"GET", "/v1/bot/xyz/sends", "xyz", true},
+		{"GET", "/v1/user/abc/updates/subscriptions", "abc", true},
+		{"POST", "/v1/bot/xyz/updates/subscriptions", "xyz", true},
+		{"GET", "/v1/user/abc/updates/subscriptions/s1", "abc", true},
+		{"DELETE", "/v1/bot/xyz/updates/subscriptions/s1", "xyz", true},
 
 		// denied: management and lifecycle
 		{"POST", "/v1/user/abc", "", false},
@@ -39,6 +49,12 @@ func TestSessionTarget(t *testing.T) {
 		{"GET", "/v1/user/abc/files", "", false},      // needs a file id
 		{"POST", "/v1/user/abc/sends", "", false},     // resolve is GET-only
 		{"GET", "/v1/user/abc/sends/1", "", false},    // ids go in the query
+
+		{"DELETE", "/v1/user/abc/updates/subscriptions", "", false},   // needs an id
+		{"POST", "/v1/user/abc/updates/subscriptions/s1", "", false},  // create has no id
+		{"PUT", "/v1/user/abc/updates/subscriptions/s1", "", false},   // no updates in place
+		{"GET", "/v1/user/abc/updates/subscriptions/s1/x", "", false}, // nothing below one
+		{"GET", "/v1/user/abc/updates", "", false},
 	}
 	for _, c := range cases {
 		gotID, gotOK := sessionTarget(c.method, c.path)
@@ -81,5 +97,34 @@ func TestIsFilesPath(t *testing.T) {
 		if isFilesPath(p) {
 			t.Errorf("isFilesPath(%q) = true, want false", p)
 		}
+	}
+}
+
+// TestForwardTokenHeader: the worker records whoever the gateway says created a
+// subscription, so the header must carry only the authenticated token — never
+// a value the client sent.
+func TestForwardTokenHeader(t *testing.T) {
+	var got []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		got = r.Header.Values(tokenIDHeader)
+	}))
+	defer upstream.Close()
+	rt := &Router{transport: http.DefaultTransport}
+
+	send := func(ctxToken string) []string {
+		req := httptest.NewRequest(http.MethodPost, "/v1/bot/x/updates/subscriptions", nil)
+		req.Header.Set(tokenIDHeader, "forged")
+		if ctxToken != "" {
+			req = req.WithContext(context.WithValue(req.Context(), tokenIDKey{}, ctxToken))
+		}
+		got = nil
+		rt.forward(httptest.NewRecorder(), req, upstream.URL)
+		return got
+	}
+	if h := send(""); len(h) != 0 {
+		t.Errorf("master request forwarded %q, want no token header", h)
+	}
+	if h := send("tok-1"); len(h) != 1 || h[0] != "tok-1" {
+		t.Errorf("scoped request forwarded %q, want [tok-1]", h)
 	}
 }

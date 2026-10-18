@@ -4,9 +4,12 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -41,10 +44,8 @@ func NewServer(st *store.Store, sec *secret.Box, mgr *session.Manager) http.Hand
 	mux.HandleFunc("POST /v1/user/{id}/login/resend", s.handleLoginResend)
 	mux.HandleFunc("POST /v1/user/{id}/call", s.handleCall)
 	mux.HandleFunc("POST /v1/bot/{id}/call", s.handleCall)
-	mux.HandleFunc("PUT /v1/user/{id}/updates/webhook", s.handleSetWebhook)
-	mux.HandleFunc("PUT /v1/bot/{id}/updates/webhook", s.handleSetWebhook)
-	mux.HandleFunc("DELETE /v1/user/{id}/updates/webhook", s.handleDeleteWebhook)
-	mux.HandleFunc("DELETE /v1/bot/{id}/updates/webhook", s.handleDeleteWebhook)
+	mux.HandleFunc("POST /v1/user/{id}/updates/subscriptions", s.handleCreateSubscription)
+	mux.HandleFunc("POST /v1/bot/{id}/updates/subscriptions", s.handleCreateSubscription)
 	mux.HandleFunc("GET /v1/user/{id}", s.handleGetSession)
 	mux.HandleFunc("GET /v1/bot/{id}", s.handleGetSession)
 	mux.HandleFunc("GET /v1/user/{id}/files/{file_id}", s.handleDownloadFile)
@@ -381,34 +382,65 @@ func (s *Server) handleCall(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, json.RawMessage(result))
 }
 
-func (s *Server) handleSetWebhook(w http.ResponseWriter, r *http.Request) {
+// tokenIDHeader carries the scoped token a request was authenticated with.
+// The gateway sets it on every request it forwards (and strips any copy a
+// client sent), so it is only as trustworthy as the gateway; workers are not
+// published. Must match router.tokenIDHeader.
+const tokenIDHeader = "X-Tgcontrol-Token-Id"
+
+// handleCreateSubscription adds an update subscription to a session. It runs on
+// a worker because only workers hold the key that encrypts the secret. The
+// subscription belongs to the token that created it (none for the master
+// token). Without a secret in the request one is generated and returned — the
+// only time it is shown — so each subscription gets its own by default.
+func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		URL     string `json:"url"`
-		Secret  string `json:"secret"`
-		Filters struct {
-			Types []string `json:"types"`
-		} `json:"filters"`
+		URL     string             `json:"url"`
+		Secret  string             `json:"secret"`
+		Filters session.FilterSpec `json:"filters"`
 	}
 	if !decode(w, r, &req) {
 		return
 	}
-	if req.URL == "" {
-		writeErr(w, http.StatusBadRequest, "url is required")
+	if u, err := url.Parse(req.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		writeErr(w, http.StatusBadRequest, "url must be an absolute http(s) URL")
 		return
 	}
-	if err := s.mgr.SetWebhook(r.Context(), r.PathValue("id"), req.URL, req.Secret, req.Filters.Types); err != nil {
+	plain, generated := req.Secret, false
+	if plain == "" {
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		plain, generated = base64.RawURLEncoding.EncodeToString(b), true
+	}
+	secEnc, err := s.sec.Encrypt([]byte(plain))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var filters []byte
+	if len(req.Filters.Types) > 0 || len(req.Filters.Chats) > 0 {
+		if filters, err = json.Marshal(req.Filters); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	id := r.PathValue("id")
+	subID, err := s.st.CreateSubscription(r.Context(), id, r.Header.Get(tokenIDHeader), req.URL, secEnc, filters)
+	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	writeOK(w, map[string]any{"status": "ok"})
-}
-
-func (s *Server) handleDeleteWebhook(w http.ResponseWriter, r *http.Request) {
-	if err := s.mgr.DeleteWebhook(r.Context(), r.PathValue("id")); err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
+	// Start routing to it now if the session lives here; otherwise the owner
+	// picks it up on its next sync.
+	s.mgr.RefreshSubscriptions(r.Context(), id)
+	out := map[string]any{"id": subID}
+	if generated {
+		out["secret"] = plain
 	}
-	writeOK(w, map[string]any{"status": "deleted"})
+	writeOK(w, out)
 }
 
 func (s *Server) handleUpdateSession(w http.ResponseWriter, r *http.Request) {

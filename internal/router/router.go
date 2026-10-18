@@ -31,6 +31,12 @@ import (
 // requests, which see everything.
 type tokenIDKey struct{}
 
+// tokenIDHeader hands that id to the worker a request is forwarded to, which
+// records it as the owner of what it creates. forward always overwrites it, so
+// a client cannot claim another token's identity. Must match
+// api.tokenIDHeader.
+const tokenIDHeader = "X-Tgcontrol-Token-Id"
+
 type Router struct {
 	st        *store.Store
 	stale     time.Duration
@@ -70,6 +76,12 @@ func New(st *store.Store, stale time.Duration, token string, uploads *upload.Sto
 	mux.HandleFunc("GET /v1/workers", rt.listWorkers)
 	mux.HandleFunc("GET /v1/user/{id}/sends", rt.getSend)
 	mux.HandleFunc("GET /v1/bot/{id}/sends", rt.getSend)
+	mux.HandleFunc("GET /v1/user/{id}/updates/subscriptions", rt.listSubscriptions)
+	mux.HandleFunc("GET /v1/bot/{id}/updates/subscriptions", rt.listSubscriptions)
+	mux.HandleFunc("GET /v1/user/{id}/updates/subscriptions/{sub}", rt.getSubscription)
+	mux.HandleFunc("GET /v1/bot/{id}/updates/subscriptions/{sub}", rt.getSubscription)
+	mux.HandleFunc("DELETE /v1/user/{id}/updates/subscriptions/{sub}", rt.deleteSubscription)
+	mux.HandleFunc("DELETE /v1/bot/{id}/updates/subscriptions/{sub}", rt.deleteSubscription)
 
 	// Registry writes served directly by the gateway (rename only; ids immutable).
 	mux.HandleFunc("PATCH /v1/apps/{id}", rt.updateApp)
@@ -99,10 +111,6 @@ func New(st *store.Store, stale time.Duration, token string, uploads *upload.Sto
 	mux.HandleFunc("POST /v1/user/{id}/login/resend", rt.scoped)
 	mux.HandleFunc("POST /v1/user/{id}/call", rt.scoped)
 	mux.HandleFunc("POST /v1/bot/{id}/call", rt.scoped)
-	mux.HandleFunc("PUT /v1/user/{id}/updates/webhook", rt.scoped)
-	mux.HandleFunc("PUT /v1/bot/{id}/updates/webhook", rt.scoped)
-	mux.HandleFunc("DELETE /v1/user/{id}/updates/webhook", rt.scoped)
-	mux.HandleFunc("DELETE /v1/bot/{id}/updates/webhook", rt.scoped)
 	mux.HandleFunc("GET /v1/user/{id}", rt.scoped)
 	mux.HandleFunc("GET /v1/bot/{id}", rt.scoped)
 	mux.HandleFunc("GET /v1/user/{id}/files/{file_id}", rt.scoped)
@@ -111,14 +119,19 @@ func New(st *store.Store, stale time.Duration, token string, uploads *upload.Sto
 	mux.HandleFunc("DELETE /v1/bot/{id}", rt.ownerOrAnyWorker)
 	mux.HandleFunc("PATCH /v1/user/{id}", rt.ownerOrAnyWorker)
 	mux.HandleFunc("PATCH /v1/bot/{id}", rt.ownerOrAnyWorker)
+	// Creating a subscription encrypts its secret, which only workers can do;
+	// any worker will, since the owner picks new subscriptions up by itself.
+	mux.HandleFunc("POST /v1/user/{id}/updates/subscriptions", rt.ownerOrAnyWorker)
+	mux.HandleFunc("POST /v1/bot/{id}/updates/subscriptions", rt.ownerOrAnyWorker)
 
 	return rt.auth(mux)
 }
 
 // auth enforces the token model. The master token (from env) grants everything.
-// A scoped DB token (looked up by secret hash) may only invoke a session's /call
-// or read its status, and only for sessions its scope covers; everything else is
-// master-only. GET /healthz is always open for liveness probes.
+// A scoped DB token (looked up by secret hash) may only use a session's own
+// routes (see sessionTarget), and only for sessions its scope covers;
+// everything else is master-only. GET /healthz is always open for liveness
+// probes.
 func (rt *Router) auth(next http.Handler) http.Handler {
 	masterWant := []byte("Bearer " + rt.master)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -190,13 +203,14 @@ func (rt *Router) auth(next http.Handler) http.Handler {
 			writeErr(w, http.StatusForbidden, "token not permitted for this session")
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), tokenIDKey{}, id)))
 	})
 }
 
 // sessionTarget reports whether (method, path) is a route a scoped token may use
-// — a session's /call or status read — and returns that session id. Everything
-// else is master-only.
+// — a session's /call, status read, downloads, send resolution and its own
+// update subscriptions — and returns that session id. Everything else is
+// master-only.
 func sessionTarget(method, path string) (string, bool) {
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	if len(parts) < 3 || parts[0] != "v1" || (parts[1] != "user" && parts[1] != "bot") {
@@ -214,6 +228,15 @@ func sessionTarget(method, path string) (string, bool) {
 	}
 	if method == http.MethodGet && len(parts) == 4 && parts[3] == "sends" {
 		return id, true // GET /v1/{kind}/{id}/sends — resolve a temporary id
+	}
+	if len(parts) >= 5 && parts[3] == "updates" && parts[4] == "subscriptions" {
+		// The handlers narrow a scoped token to the subscriptions it owns.
+		switch {
+		case len(parts) == 5 && (method == http.MethodGet || method == http.MethodPost):
+			return id, true // list, create
+		case len(parts) == 6 && (method == http.MethodGet || method == http.MethodDelete):
+			return id, true // read, remove one
+		}
 	}
 	return "", false
 }
@@ -306,6 +329,68 @@ func (rt *Router) getSend(w http.ResponseWriter, r *http.Request) {
 		out["error"] = json.RawMessage(rec.Error)
 	}
 	writeOK(w, out)
+}
+
+// --- update subscriptions ---
+
+// tokenOf returns the scoped token a request was authenticated with, or "" for
+// the master token.
+func tokenOf(r *http.Request) string {
+	id, _ := r.Context().Value(tokenIDKey{}).(string)
+	return id
+}
+
+// listSubscriptions returns a session's update subscriptions with their
+// delivery status: all of them for the master token, a scoped token's own
+// otherwise. Served from the registry, so it answers while the session is
+// unhosted too.
+func (rt *Router) listSubscriptions(w http.ResponseWriter, r *http.Request) {
+	if _, ok := rt.resolveSession(w, r); !ok {
+		return
+	}
+	items, err := rt.st.ListSubscriptions(r.Context(), r.PathValue("id"), tokenOf(r), "")
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeOK(w, items)
+}
+
+// getSubscription returns one subscription and its delivery status. Another
+// token's subscription reads as not found, the same as one that never existed.
+func (rt *Router) getSubscription(w http.ResponseWriter, r *http.Request) {
+	if _, ok := rt.resolveSession(w, r); !ok {
+		return
+	}
+	items, err := rt.st.ListSubscriptions(r.Context(), r.PathValue("id"), tokenOf(r), r.PathValue("sub"))
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if len(items) == 0 {
+		writeErr(w, http.StatusNotFound, "subscription not found")
+		return
+	}
+	writeOK(w, items[0])
+}
+
+// deleteSubscription removes a subscription and whatever it still had queued.
+// The owning worker notices on its next sync; until then nothing more is
+// queued for it, because queueing only targets subscriptions that still exist.
+func (rt *Router) deleteSubscription(w http.ResponseWriter, r *http.Request) {
+	if _, ok := rt.resolveSession(w, r); !ok {
+		return
+	}
+	found, err := rt.st.DeleteSubscription(r.Context(), r.PathValue("id"), tokenOf(r), r.PathValue("sub"))
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "subscription not found")
+		return
+	}
+	writeOK(w, map[string]any{"status": "deleted"})
 }
 
 // --- registry write handlers (rename; ids stay immutable) ---
@@ -526,6 +611,12 @@ func (rt *Router) forward(w http.ResponseWriter, r *http.Request, base string) {
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "bad worker address")
 		return
+	}
+	// Only the gateway speaks for who is calling: drop anything the client sent
+	// under this name, then state the authenticated token, if scoped.
+	r.Header.Del(tokenIDHeader)
+	if id := tokenOf(r); id != "" {
+		r.Header.Set(tokenIDHeader, id)
 	}
 	p := httputil.NewSingleHostReverseProxy(target)
 	p.Transport = rt.transport

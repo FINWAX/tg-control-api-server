@@ -35,8 +35,8 @@ type liveSession struct {
 	status  string
 	cl      *client.Client
 	err     error
-	hasWH   bool            // a webhook subscription exists -> updates go to the outbox
-	whTypes map[string]bool // allowed update @types; nil = all
+	subs    *subSnapshot // update subscriptions as last loaded; nil = none
+	dropped atomic.Int64 // updates lost before queueing, not yet recorded
 
 	// Interactive login state. The client is stashed while the authorizer is
 	// still driving the login (so a resend can reach it), and loggingIn keeps
@@ -78,10 +78,11 @@ func (m *Manager) newLiveSession(id, kind string, interactive bool) *liveSession
 	return ls
 }
 
-// updateHandler queues td_api Update objects for the session's webhook (if
-// subscribed and not filtered out). It runs on the client's receiver
-// goroutine, so it must not block: the type check and json.Marshal are cheap
-// and the outbox send is non-blocking.
+// updateHandler queues td_api Update objects some subscription of the session
+// may want. It runs on the client's receiver goroutine, so it must not block:
+// the type check and json.Marshal are cheap and the outbox send is
+// non-blocking. Matching against each subscription's filter is left to the
+// outbox writer.
 func (m *Manager) updateHandler(ls *liveSession) client.ResultHandler {
 	return client.NewCallbackResultHandler(func(result client.Type) {
 		if result.GetType() != client.TypeUpdate {
@@ -104,13 +105,10 @@ func (m *Manager) updateHandler(ls *liveSession) client.ResultHandler {
 			}
 		}
 		ls.mu.Lock()
-		on := ls.hasWH
-		types := ls.whTypes
+		snap := ls.subs
 		ls.mu.Unlock()
-		if !on {
-			return
-		}
-		if types != nil && !types[result.GetConstructor()] {
+		ctor := result.GetConstructor()
+		if !snap.wants(ctor) {
 			return
 		}
 		b, err := json.Marshal(result)
@@ -118,28 +116,14 @@ func (m *Manager) updateHandler(ls *liveSession) client.ResultHandler {
 			return
 		}
 		select {
-		case m.outbox <- outItem{sessionID: ls.id, payload: b}:
+		case m.outbox <- outItem{sessionID: ls.id, ctor: ctor, payload: b, subs: snap}:
 		default:
+			// Counted, so the loss shows in every subscription's status
+			// instead of only in this log.
+			ls.dropped.Add(1)
 			log.Printf("outbox: queue full, dropping update for %s", ls.id)
 		}
 	})
-}
-
-// filterSpec is the stored webhook filter: an allowlist of update @types.
-type filterSpec struct {
-	Types []string `json:"types"`
-}
-
-// typeSet builds an allowlist set from update types, or nil for "all".
-func typeSet(types []string) map[string]bool {
-	if len(types) == 0 {
-		return nil
-	}
-	set := make(map[string]bool, len(types))
-	for _, t := range types {
-		set[t] = true
-	}
-	return set
 }
 
 // setStatus records a status change and mirrors it to the registry. The mirror
@@ -371,6 +355,7 @@ func NewManager(st *store.Store, sec *secret.Box, dataDir, workerID, selfAddr st
 	go m.runReconciler()
 	go m.runOutboxWriter()
 	go m.runOutboxDispatcher()
+	go m.runSubscriptionSync()
 	go m.runSendWriter()
 	go m.runRetention()
 	return m
@@ -729,8 +714,8 @@ func (m *Manager) proxyRequest(ctx context.Context, proxyID string) (*client.Add
 
 // rehydrateOne restores one session from its on-disk binlog: the TDLib client
 // is rebuilt on its existing directory (the binlog already holds the
-// authorization) so it reaches Ready without phone/code, webhook delivery is
-// re-armed, and the live map is repopulated. A binlog that no longer authorizes
+// authorization) so it reaches Ready without phone/code, its update
+// subscriptions are loaded, and the live map is repopulated. A binlog that no longer authorizes
 // yields errRehydrateExpired and the session is marked expired.
 func (m *Manager) rehydrateOne(ctx context.Context, r store.Rehydratable) error {
 	app, err := m.st.GetApp(ctx, r.AppID)
@@ -752,6 +737,9 @@ func (m *Manager) rehydrateOne(ctx context.Context, r store.Rehydratable) error 
 
 	ls := m.newLiveSession(r.ID, r.Kind, false)
 	m.put(ls)
+	// Before the client exists: updates flow from its first moment, and any
+	// that arrive before the subscriptions are known would be lost.
+	m.syncSubscriptions(ctx, []*liveSession{ls})
 
 	h := &authHandler{
 		params:    m.buildParams(r.DBDir, dbKey, app.APIID, string(apiHash)),
@@ -776,23 +764,6 @@ func (m *Manager) rehydrateOne(ctx context.Context, r store.Rehydratable) error 
 	}
 	m.clearRetry(r.ID)
 	ls.setClient(cl)
-
-	// Re-arm webhook delivery if a subscription exists (target lives in the DB;
-	// the dispatcher reads it per delivery). Filters are applied in-process, so
-	// load them into the live session.
-	if w, err := m.st.GetWebhook(ctx, r.ID); err == nil && w != nil {
-		var types []string
-		if len(w.Filters) > 0 {
-			var fs filterSpec
-			if json.Unmarshal(w.Filters, &fs) == nil {
-				types = fs.Types
-			}
-		}
-		ls.mu.Lock()
-		ls.hasWH = true
-		ls.whTypes = typeSet(types)
-		ls.mu.Unlock()
-	}
 	return nil
 }
 
@@ -1264,56 +1235,6 @@ func forceLoadChat(params json.RawMessage) (method string, q json.RawMessage, ok
 	return method, b, true
 }
 
-// SetWebhook persists the session's webhook subscription and (re)arms live
-// delivery. Secret is encrypted at rest; the plaintext is kept in-process for
-// HMAC signing.
-func (m *Manager) SetWebhook(ctx context.Context, id, url, secret string, types []string) error {
-	ls := m.get(id)
-	if ls == nil {
-		return errors.New("session not found")
-	}
-	var secEnc []byte
-	if secret != "" {
-		var err error
-		if secEnc, err = m.sec.Encrypt([]byte(secret)); err != nil {
-			return err
-		}
-	}
-	var filters []byte
-	if len(types) > 0 {
-		var err error
-		if filters, err = json.Marshal(filterSpec{Types: types}); err != nil {
-			return err
-		}
-	}
-	if err := m.st.SetWebhook(ctx, id, url, secEnc, filters); err != nil {
-		return err
-	}
-	ls.mu.Lock()
-	ls.hasWH = true
-	ls.whTypes = typeSet(types)
-	ls.mu.Unlock()
-	return nil
-}
-
-// DeleteWebhook removes the session's webhook subscription, cancels its
-// still-pending deliveries, and disarms in-process delivery. Idempotent.
-func (m *Manager) DeleteWebhook(ctx context.Context, id string) error {
-	if err := m.st.DeleteWebhook(ctx, id); err != nil {
-		return err
-	}
-	if err := m.st.CancelPendingDeliveries(ctx, id); err != nil {
-		return err
-	}
-	if ls := m.get(id); ls != nil {
-		ls.mu.Lock()
-		ls.hasWH = false
-		ls.whTypes = nil
-		ls.mu.Unlock()
-	}
-	return nil
-}
-
 // UpdateSession changes a session's mutable fields (label and/or proxy). When
 // the proxy changes and this worker holds the live client, the new proxy is
 // applied on the running connection (TDLib addProxy/disableProxy) so the change
@@ -1382,7 +1303,7 @@ func (m *Manager) applyProxy(ctx context.Context, cl *client.Client, proxyID str
 
 // DeleteSession permanently removes a session. If this worker holds the live
 // client, it is closed first (releasing the binlog lock); then the registry row
-// is dropped (cascading its webhook subscription and pending deliveries) and the
+// is dropped (cascading its webhook subscriptions and pending deliveries) and the
 // on-disk directory is removed. The gateway routes deletes to the owning worker
 // when one is alive, so the client closed here is the one actually holding it.
 func (m *Manager) DeleteSession(ctx context.Context, id string) error {

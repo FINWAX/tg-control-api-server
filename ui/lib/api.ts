@@ -137,3 +137,21 @@ export interface Token {
   session_ids: string[];
   created_at: string;
 }
+
+// Subscription is one update webhook of a session with its delivery status.
+// token_id is null for a subscription made with the master token. dropped
+// counts updates the session lost before they could be queued.
+export interface Subscription {
+  id: string;
+  session_id: string;
+  token_id: string | null;
+  url: string;
+  filters?: { types?: string[]; chats?: number[] };
+  created_at: string;
+  last_delivered_at: string | null;
+  last_error: string | null;
+  last_error_at: string | null;
+  pending: number;
+  failed: number;
+  dropped: number;
+}

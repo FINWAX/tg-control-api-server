@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -649,7 +650,7 @@ func (s *Store) TokenGrantsSession(ctx context.Context, tokenID, sessionID strin
 
 // DeleteSession removes a session row and returns its on-disk db_dir so the
 // caller can delete the directory. The delete cascades to the session's webhook
-// subscription and queued deliveries (ON DELETE CASCADE). found is false when no
+// subscriptions and queued deliveries (ON DELETE CASCADE). found is false when no
 // such session exists.
 func (s *Store) DeleteSession(ctx context.Context, id string) (dbDir string, found bool, err error) {
 	err = s.pool.QueryRow(ctx,
@@ -858,107 +859,220 @@ func (s *Store) PickWorker(ctx context.Context, aliveCutoff time.Time) (string, 
 	return addr, err
 }
 
-// Webhook is a session's update-delivery subscription (kind='webhook').
-// Filters is a raw jsonb object ({"types":[...]}), or nil for "all updates".
-type Webhook struct {
-	URL       string
-	SecretEnc []byte
-	Filters   []byte
+// Subscription is one update subscription of a session, with its delivery
+// status. TokenID names the scoped token that owns it; nil means it was created
+// with the master token. Dropped counts updates the session lost before they
+// could be queued (see AddDropped) while this subscription existed.
+type Subscription struct {
+	ID              string          `json:"id"`
+	SessionID       string          `json:"session_id"`
+	TokenID         *string         `json:"token_id"`
+	URL             string          `json:"url"`
+	Filters         json.RawMessage `json:"filters,omitempty"`
+	CreatedAt       time.Time       `json:"created_at"`
+	LastDeliveredAt *time.Time      `json:"last_delivered_at"`
+	LastError       *string         `json:"last_error"`
+	LastErrorAt     *time.Time      `json:"last_error_at"`
+	Pending         int64           `json:"pending"`
+	Failed          int64           `json:"failed"`
+	Dropped         int64           `json:"dropped"`
 }
 
-// SetWebhook upserts the session's webhook subscription.
-func (s *Store) SetWebhook(ctx context.Context, sessionID, url string, secretEnc, filters []byte) error {
+// CreateSubscription adds a subscription to a session. tokenID is the owning
+// scoped token, or "" for the master token. filters is a raw jsonb object, or
+// nil for "every update".
+func (s *Store) CreateSubscription(ctx context.Context, sessionID, tokenID, url string, secretEnc, filters []byte) (string, error) {
 	var f any
 	if len(filters) > 0 {
 		f = string(filters)
 	}
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO update_subscription (session_id, kind, url, secret_enc, filters)
-		 VALUES ($1,'webhook',$2,$3,$4)
-		 ON CONFLICT (session_id, kind)
-		 DO UPDATE SET url=EXCLUDED.url, secret_enc=EXCLUDED.secret_enc, filters=EXCLUDED.filters`,
-		sessionID, url, secretEnc, f)
-	return err
+	var id string
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO update_subscription (session_id, token_id, kind, url, secret_enc, filters)
+		 VALUES ($1, $2, 'webhook', $3, $4, $5) RETURNING id`,
+		sessionID, nullStr(tokenID), url, secretEnc, f).Scan(&id)
+	return id, err
 }
 
-// GetWebhook returns the session's webhook subscription, or nil if none.
-func (s *Store) GetWebhook(ctx context.Context, sessionID string) (*Webhook, error) {
-	w := &Webhook{}
-	var filters *string
-	err := s.pool.QueryRow(ctx,
-		`SELECT url, secret_enc, filters FROM update_subscription WHERE session_id=$1 AND kind='webhook'`,
-		sessionID).Scan(&w.URL, &w.SecretEnc, &filters)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
+// ListSubscriptions returns a session's subscriptions with their delivery
+// status. A non-empty tokenID narrows the list to that token's own; "" (the
+// master token) sees them all. subID, when set, selects a single one.
+func (s *Store) ListSubscriptions(ctx context.Context, sessionID, tokenID, subID string) ([]Subscription, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT sub.id, sub.session_id, sub.token_id::text, sub.url, sub.filters::text,
+		        sub.created_at, sub.last_delivered_at, sub.last_error, sub.last_error_at,
+		        (SELECT count(*) FROM webhook_delivery d WHERE d.subscription_id=sub.id AND d.status='pending'),
+		        (SELECT count(*) FROM webhook_delivery d WHERE d.subscription_id=sub.id AND d.status='failed'),
+		        sub.dropped
+		 FROM update_subscription sub
+		 WHERE sub.session_id=$1
+		   AND ($2 = '' OR sub.token_id::text = $2)
+		   AND ($3 = '' OR sub.id::text = $3)
+		 ORDER BY sub.created_at`, sessionID, tokenID, subID)
 	if err != nil {
 		return nil, err
 	}
-	if filters != nil {
-		w.Filters = []byte(*filters)
+	defer rows.Close()
+	out := []Subscription{}
+	for rows.Next() {
+		var (
+			sub     Subscription
+			filters *string
+		)
+		if err := rows.Scan(&sub.ID, &sub.SessionID, &sub.TokenID, &sub.URL, &filters,
+			&sub.CreatedAt, &sub.LastDeliveredAt, &sub.LastError, &sub.LastErrorAt,
+			&sub.Pending, &sub.Failed, &sub.Dropped); err != nil {
+			return nil, err
+		}
+		if filters != nil {
+			sub.Filters = json.RawMessage(*filters)
+		}
+		out = append(out, sub)
 	}
-	return w, nil
+	return out, rows.Err()
 }
 
-// DeleteWebhook removes the session's webhook subscription (idempotent).
-func (s *Store) DeleteWebhook(ctx context.Context, sessionID string) error {
+// DeleteSubscription removes one subscription of a session, and with it every
+// delivery still queued for it (cascade). A non-empty tokenID only matches that
+// token's own subscriptions, so a token cannot remove another's — it sees the
+// same "not found" as for an id that never existed.
+func (s *Store) DeleteSubscription(ctx context.Context, sessionID, tokenID, subID string) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM update_subscription
+		 WHERE session_id=$1 AND id::text=$3 AND ($2 = '' OR token_id::text = $2)`,
+		sessionID, tokenID, subID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// SubscriptionFilter is what a worker needs to route updates: which
+// subscription, and its raw filter (nil = every update).
+type SubscriptionFilter struct {
+	ID        string
+	SessionID string
+	Filters   []byte
+}
+
+// SubscriptionFilters returns the subscriptions of the given sessions. A worker
+// reloads these for the sessions it holds, so subscriptions created or removed
+// through any gateway take effect without a restart.
+func (s *Store) SubscriptionFilters(ctx context.Context, sessionIDs []string) ([]SubscriptionFilter, error) {
+	if len(sessionIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, session_id, filters::text FROM update_subscription
+		 WHERE session_id = ANY($1) ORDER BY created_at`, sessionIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SubscriptionFilter
+	for rows.Next() {
+		var (
+			f       SubscriptionFilter
+			filters *string
+		)
+		if err := rows.Scan(&f.ID, &f.SessionID, &filters); err != nil {
+			return nil, err
+		}
+		if filters != nil {
+			f.Filters = []byte(*filters)
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// AddDropped records n updates the session lost before they reached the queue.
+// The loss happens before an update is matched to subscriptions, so every
+// subscription the session has is charged with it.
+func (s *Store) AddDropped(ctx context.Context, sessionID string, n int64) error {
 	_, err := s.pool.Exec(ctx,
-		`DELETE FROM update_subscription WHERE session_id=$1 AND kind='webhook'`, sessionID)
+		`UPDATE update_subscription SET dropped = dropped + $2 WHERE session_id=$1`,
+		sessionID, n)
 	return err
 }
 
-// CancelPendingDeliveries drops still-pending deliveries for a session, so
-// removing a subscription doesn't leave undeliverable rows behind.
-func (s *Store) CancelPendingDeliveries(ctx context.Context, sessionID string) error {
-	_, err := s.pool.Exec(ctx,
-		`DELETE FROM webhook_delivery WHERE session_id=$1 AND status='pending'`, sessionID)
-	return err
-}
-
-// PurgeDeliveries removes terminal (delivered/failed) rows older than before,
-// returning how many were deleted.
+// PurgeDeliveries removes rows older than before, returning how many were
+// deleted. That includes rows still pending: a retry schedule spans well under
+// an hour, so a pending row this old is one that can no longer be sent — its
+// token disabled, or its session unhosted all along — and would otherwise
+// linger forever.
 func (s *Store) PurgeDeliveries(ctx context.Context, before time.Time) (int64, error) {
 	tag, err := s.pool.Exec(ctx,
-		`DELETE FROM webhook_delivery
-		 WHERE status IN ('delivered','failed') AND created_at < $1`, before)
+		`DELETE FROM webhook_delivery WHERE created_at < $1`, before)
 	if err != nil {
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
 }
 
-// Delivery is one queued webhook payload plus its current subscription target.
+// Delivery is one queued webhook payload plus its subscription's target.
 type Delivery struct {
-	ID        string
-	SessionID string
-	Payload   []byte
-	Attempts  int
-	URL       string
-	SecretEnc []byte
+	ID             string
+	SessionID      string
+	Kind           string // the session's kind: user or bot
+	SubscriptionID string
+	Payload        []byte
+	Attempts       int
+	URL            string
+	SecretEnc      []byte
 }
 
-// EnqueueDelivery persists an update payload for at-least-once delivery.
-func (s *Store) EnqueueDelivery(ctx context.Context, sessionID string, payload []byte) error {
+// EnqueueDeliveries queues one payload for each of the given subscriptions. A
+// subscription removed since the caller looked it up is skipped rather than
+// failing the rest.
+func (s *Store) EnqueueDeliveries(ctx context.Context, sessionID string, subIDs []string, payload []byte) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO webhook_delivery (session_id, payload) VALUES ($1, $2::jsonb)`,
-		sessionID, string(payload))
+		`INSERT INTO webhook_delivery (session_id, subscription_id, payload)
+		 SELECT $1, sub.id, $3::jsonb FROM update_subscription sub
+		 WHERE sub.id = ANY($2) AND sub.session_id = $1`,
+		sessionID, subIDs, string(payload))
 	return err
 }
 
 // ClaimDeliveries returns due pending deliveries for sessions owned by
-// workerID, joined with their current subscription. Delivery is partitioned by
-// owner: each worker delivers only its own sessions' updates, so one dispatcher
-// per worker means no two workers claim the same row (no locking needed). Rows
-// whose subscription was removed are not returned (they linger until cleanup).
-func (s *Store) ClaimDeliveries(ctx context.Context, workerID string, limit int) ([]Delivery, error) {
+// workerID. Delivery is partitioned by owner: each worker delivers only its own
+// sessions' updates, so one dispatcher per worker means no two workers claim
+// the same row (no locking needed).
+//
+// Three things keep one receiver from holding up the rest. busy names the
+// subscriptions whose deliveries are already in flight; they are skipped so a
+// slow receiver is never handed its next row while the last one is still
+// waiting. perSub caps how many rows one subscription contributes, so a backlog
+// at one receiver cannot fill the batch. And a subscription whose token is
+// disabled, or no longer covers the session, is not served at all — checked
+// here rather than when the subscription was made, so revoking access takes
+// effect at once. A deleted token takes its subscriptions with it (cascade).
+func (s *Store) ClaimDeliveries(ctx context.Context, workerID string, busy []string, perSub, limit int) ([]Delivery, error) {
+	if busy == nil {
+		busy = []string{}
+	}
 	rows, err := s.pool.Query(ctx,
-		`SELECT d.id, d.session_id, d.payload::text, d.attempts, sub.url, sub.secret_enc
-		 FROM webhook_delivery d
-		 JOIN update_subscription sub ON sub.session_id = d.session_id AND sub.kind='webhook'
-		 JOIN session ss ON ss.id = d.session_id
-		 WHERE d.status='pending' AND d.next_try_at <= now() AND ss.worker_id = $1
-		 ORDER BY d.next_try_at
-		 LIMIT $2`, workerID, limit)
+		`SELECT id, session_id, kind, subscription_id, payload, attempts, url, secret_enc FROM (
+		   SELECT d.id, d.session_id, ss.kind, d.subscription_id, d.payload::text AS payload,
+		          d.attempts, sub.url, sub.secret_enc, d.next_try_at,
+		          row_number() OVER (PARTITION BY d.subscription_id
+		                             ORDER BY d.next_try_at, d.created_at) AS rn
+		   FROM webhook_delivery d
+		   JOIN update_subscription sub ON sub.id = d.subscription_id
+		   JOIN session ss ON ss.id = d.session_id
+		   LEFT JOIN api_token t ON t.id = sub.token_id
+		   WHERE d.status='pending' AND d.next_try_at <= now() AND ss.worker_id = $1
+		     AND NOT (d.subscription_id::text = ANY($2))
+		     AND (sub.token_id IS NULL OR (t.enabled AND (
+		           t.all_sessions
+		           OR EXISTS(SELECT 1 FROM api_token_session ts
+		                     WHERE ts.token_id=t.id AND ts.session_id=d.session_id)
+		           OR EXISTS(SELECT 1 FROM api_token_app ta
+		                     WHERE ta.token_id=t.id AND ta.app_id=ss.app_id))))
+		 ) due
+		 WHERE rn <= $3
+		 ORDER BY next_try_at
+		 LIMIT $4`, workerID, busy, perSub, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -966,7 +1080,8 @@ func (s *Store) ClaimDeliveries(ctx context.Context, workerID string, limit int)
 	var out []Delivery
 	for rows.Next() {
 		var d Delivery
-		if err := rows.Scan(&d.ID, &d.SessionID, &d.Payload, &d.Attempts, &d.URL, &d.SecretEnc); err != nil {
+		if err := rows.Scan(&d.ID, &d.SessionID, &d.Kind, &d.SubscriptionID, &d.Payload,
+			&d.Attempts, &d.URL, &d.SecretEnc); err != nil {
 			return nil, err
 		}
 		out = append(out, d)
@@ -974,23 +1089,31 @@ func (s *Store) ClaimDeliveries(ctx context.Context, workerID string, limit int)
 	return out, rows.Err()
 }
 
-// MarkDelivered marks a delivery as successfully sent.
+// MarkDelivered marks a delivery as sent and stamps its subscription's last
+// success.
 func (s *Store) MarkDelivered(ctx context.Context, id string) error {
 	_, err := s.pool.Exec(ctx,
-		`UPDATE webhook_delivery SET status='delivered', attempts=attempts+1 WHERE id=$1`, id)
+		`WITH d AS (
+		   UPDATE webhook_delivery SET status='delivered', attempts=attempts+1
+		   WHERE id=$1 RETURNING subscription_id)
+		 UPDATE update_subscription SET last_delivered_at=now()
+		 WHERE id IN (SELECT subscription_id FROM d)`, id)
 	return err
 }
 
-// FailDelivery records a failed attempt: either reschedule with backoff or, if
-// giving up, mark the delivery failed.
-func (s *Store) FailDelivery(ctx context.Context, id string, nextTry time.Time, giveUp bool) error {
-	if giveUp {
-		_, err := s.pool.Exec(ctx,
-			`UPDATE webhook_delivery SET status='failed', attempts=attempts+1 WHERE id=$1`, id)
-		return err
-	}
+// FailDelivery records a failed attempt — either rescheduled with backoff or,
+// when giving up, marked failed — and keeps the error on the subscription so a
+// consumer can see why its receiver is not being reached.
+func (s *Store) FailDelivery(ctx context.Context, id string, nextTry time.Time, giveUp bool, reason string) error {
 	_, err := s.pool.Exec(ctx,
-		`UPDATE webhook_delivery SET attempts=attempts+1, next_try_at=$2 WHERE id=$1`, id, nextTry)
+		`WITH d AS (
+		   UPDATE webhook_delivery
+		   SET attempts=attempts+1,
+		       status=CASE WHEN $3 THEN 'failed' ELSE status END,
+		       next_try_at=CASE WHEN $3 THEN next_try_at ELSE $2 END
+		   WHERE id=$1 RETURNING subscription_id)
+		 UPDATE update_subscription SET last_error=$4, last_error_at=now()
+		 WHERE id IN (SELECT subscription_id FROM d)`, id, nextTry, giveUp, reason)
 	return err
 }
 
