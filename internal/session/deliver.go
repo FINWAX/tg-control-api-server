@@ -47,12 +47,12 @@ const (
 	perSubBatch     = 100
 	maxErrorLen     = 500 // longest error kept on a subscription
 
-	retentionAge      = 24 * time.Hour   // keep terminal rows this long
+	retentionAge      = 24 * time.Hour   // keep delivery rows this long, any status
 	retentionInterval = 10 * time.Minute // sweep cadence
 	deadWorkerAge     = time.Hour        // drop registry rows unseen this long
 )
 
-// runRetention periodically purges old delivered/failed rows so the outbox
+// runRetention periodically purges old delivery rows so the outbox
 // table doesn't grow without bound. It sweeps once at startup, then on a timer.
 func (m *Manager) runRetention() {
 	m.purgeOnce()
