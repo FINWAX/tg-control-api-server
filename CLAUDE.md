@@ -53,6 +53,9 @@ API и шифруются в БД; в .env только инфра-конфиг 
 - `POST /v1/{user|bot}/{id}/call` {method, params} -> async td_api
 - `GET /v1/{user|bot}/{id}/sends?chat_id=&message_id=` -> {status:
   pending|sent|failed, message_id?, error?}; 404 - неизвестна или старше SEND_TTL
+- `POST /v1/{user|bot}/{id}/updates/subscriptions` {url, secret?, filters?:
+  {types?, chats?}} -> {id, secret?}; `GET .../subscriptions[/{sub}]` - список/одна
+  со статусом доставки; `DELETE .../subscriptions/{sub}`. Вебхуки апдейтов.
 - `POST /v1/execute` {method, params} -> синхронный td_api (без сессии)
 - `POST /v1/files?name=` -> {path} (single-shot); `PATCH/GET /v1/files/{id}`,
   `POST /v1/files/{id}/complete`, `DELETE /v1/files/{id}` (resumable). Файл для
@@ -74,6 +77,17 @@ updateMessageSendSucceeded. `/call` остаётся честным passthrough 
 session_id+chat_id+temp_id: id сообщений уникальны в пределах чата) и читается
 через `/sends`. Апсерт с обеих сторон - регистрация и апдейт гонятся, порядок
 любой. Отложенные сообщения не трекаются. Ретенция - SEND_TTL (по умолчанию 7д).
+
+Вебхуки - подписки, их несколько на сессию; подписка принадлежит токену,
+которым создана (NULL - мастер). Размножение по подпискам - при записи в
+outbox (строка webhook_delivery на подписку), не при выдаче. Чтение/удаление
+подписок - на gateway из Postgres; создание - на воркере (только у воркеров
+MASTER_KEY для шифрования секрета), токен-владелец передаётся заголовком
+X-Tgcontrol-Token-Id, который gateway всегда перезаписывает. Воркер держит
+снимок подписок своих сессий, обновляя раз в секунду. Права токена
+проверяются в момент выдачи доставки. Диспетчер: подписка в полёте не
+выдаётся повторно, потолок строк на подписку, приёмники параллельно. Контракт
+доставки: at-least-once, без порядка, дедуп по X-Tgcontrol-Delivery.
 
 Прокси на сессию поддерживается (addProxy), в локальном случае опционален; смысл -
 чтобы каждый из <50 аккаунтов мог ходить со своего IP. Схема БД версионируется

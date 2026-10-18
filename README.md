@@ -167,9 +167,12 @@ curl -s "$G/v1/bot/$SID/call" -H "Authorization: Bearer $TOKEN" \
 **5. Receive updates** (new messages, etc.) by subscribing a webhook:
 
 ```sh
-curl -s -X PUT "$G/v1/bot/$SID/updates/webhook" -H "Authorization: Bearer $TOKEN" \
-  -d '{"url":"https://your-app/telegram","secret":"...","filters":{"types":["updateNewMessage"]}}'
+curl -s -X POST "$G/v1/bot/$SID/updates/subscriptions" -H "Authorization: Bearer $TOKEN" \
+  -d '{"url":"https://your-app/telegram","filters":{"types":["updateNewMessage"]}}'
 ```
+
+The answer carries the subscription's generated secret, shown once; see
+[Receiving updates](#receiving-updates).
 
 From here: [send media](#sending-files), [download / crawl](#downloading-files-crawling),
 issue [scoped tokens](#api-tokens), or drive it all from the
@@ -229,7 +232,7 @@ Every request except `GET /healthz` must carry `Authorization: Bearer <token>`.
 | `POST /v1/files?name=` | Upload a file → `{path}` (single-shot; see [Sending files](#sending-files)) |
 | `PATCH/GET /v1/files/{id}`, `POST /v1/files/{id}/complete`, `DELETE /v1/files/{id}` | Resumable/chunked upload |
 | `GET /v1/{user\|bot}/{id}/files/{file_id}` | Download a file, streamed with Range (see [Downloading files](#downloading-files-crawling)) |
-| `PUT/DELETE /v1/{user\|bot}/{id}/updates/webhook` | Manage update delivery |
+| `POST/GET /v1/{user\|bot}/{id}/updates/subscriptions`, `GET/DELETE .../subscriptions/{sub}` | Update webhooks (see [Receiving updates](#receiving-updates)) |
 | `GET  /v1/{user\|bot}/{id}` | Session state → `{id, status, code_info?, last_error?}` |
 | `PATCH /v1/{user\|bot}/{id}` `{label?, proxy_id?}` | Rename / change proxy (applied live) |
 | `DELETE /v1/{user\|bot}/{id}` | Close and remove a session |
@@ -311,7 +314,8 @@ never polls forever.
 The `failed` branch matters as much as the id: a send that Telegram ultimately
 rejects still answers `200` at `/call`, because at that moment nothing had gone
 wrong yet. Resolving is the only way to learn it never landed without
-subscribing to updates.
+[subscribing to updates](#receiving-updates) — `updateMessageSendSucceeded` and
+`updateMessageSendFailed` carry the same outcome.
 
 How long `pending` lasts is the upload, not the send. A text message resolves in
 well under a second; media resolves only once TDLib has pushed the bytes to
@@ -529,13 +533,100 @@ The lower-level td_api path also works directly through `/call` (`downloadFile`
 → `readFilePart`), but returns bytes as base64 in JSON — the streaming endpoint
 above is preferred for anything but small files.
 
+## Receiving updates
+
+Updates — new messages, join requests, send outcomes, anything td_api emits —
+are pushed to webhook **subscriptions**. A session can have several, each with
+its own URL, secret and filter, so every consumer of an account gets its own
+stream.
+
+```sh
+curl -s -X POST "$G/v1/bot/$SID/updates/subscriptions" -H "Authorization: Bearer $TOKEN" \
+  -d '{"url":"https://your-app/telegram",
+       "filters":{"types":["updateNewMessage"],"chats":[-1001234567890]}}'
+# {"ok":true,"result":{"id":"<subscription id>","secret":"<generated>"}}
+```
+
+| Route | |
+|---|---|
+| `POST /v1/{user\|bot}/{id}/updates/subscriptions` `{url, secret?, filters?}` | Create → `{id, secret?}` |
+| `GET /v1/{user\|bot}/{id}/updates/subscriptions` | List them, with delivery status |
+| `GET /v1/{user\|bot}/{id}/updates/subscriptions/{sub}` | One, with delivery status |
+| `DELETE /v1/{user\|bot}/{id}/updates/subscriptions/{sub}` | Remove it and whatever it still had queued |
+
+A new subscription is live within a second.
+
+**Secret.** Leave `secret` out and one is generated and returned — the only
+time it is shown; it is stored encrypted. If you pass your own, give every
+subscription a different one (see [Delivery](#delivery)).
+
+**Filters** are two optional allowlists:
+
+- `types` — update `@type`s. Empty: every type.
+- `chats` — chat ids. An update's chat is its `chat_id`, else its
+  `message.chat_id`. With a chat filter set, an update about no chat at all is
+  **not** delivered: the filter means "only these chats".
+
+Filter by type unless you really want everything. A user session emits tens of
+thousands of updates as it starts — options, chat list sync, statuses — and an
+unfiltered subscription is sent every one. A burst like that can outrun the
+worker's buffer, which then shows up as `dropped`.
+
+**Ownership.** A subscription belongs to the token that created it. A scoped
+token manages subscriptions only on sessions its scope covers, and sees and
+removes only its own; the master token sees them all. A subscription stops
+being served as soon as its token is disabled or no longer covers the session —
+checked at every delivery, not just at creation — and is removed together with
+its token.
+
+### Delivery
+
+Each update is POSTed as the raw td_api `Update` JSON, with these headers:
+
+| Header | |
+|---|---|
+| `X-Tgcontrol-Session` | Session id |
+| `X-Tgcontrol-Kind` | `user` or `bot` |
+| `X-Tgcontrol-Subscription` | Subscription id |
+| `X-Tgcontrol-Delivery` | Delivery id — the same on every retry |
+| `X-Tgcontrol-Attempt` | Attempt number, from 1 |
+| `X-Tgcontrol-Signature` | `sha256=<hex>`: HMAC-SHA256 of the body, keyed with the subscription's secret |
+
+Verify the signature against the raw body. It covers the body only, not the
+headers — and the body, a raw `Update`, names neither session nor
+subscription. What proves where a delivery came from is **which secret
+verifies it**, which is why each subscription should have its own: with one
+secret shared across subscriptions, the session header is an unauthenticated
+claim that a replayed request could change.
+
+Guarantees:
+
+- **At least once.** Retries happen; deduplicate on `X-Tgcontrol-Delivery`.
+- **Unordered.** A failed delivery is retried later, behind newer ones. Do not
+  rely on arrival order.
+- Any `2xx` counts as delivered; the response body is ignored. A request times
+  out after 10 s — answer first, process afterwards.
+- Up to 10 attempts, backing off from 5 s to 5 min. After that the delivery is
+  `failed` and not retried.
+- Receivers are isolated: a slow or unreachable URL delays only its own
+  subscription, never another one of the same session or worker.
+- Queued deliveries are kept for 24 hours, delivered or not.
+
+Each subscription reports `last_delivered_at`, `last_error`, `last_error_at`,
+`pending`, `failed`, and `dropped`. `dropped` counts updates the session lost
+before they could be queued, when its worker's buffer overflowed. That loss
+happens before an update is matched to subscriptions, so it is charged to every
+subscription the session had at the time; a non-zero `dropped` means the stream
+has a gap.
+
 ## API tokens
 
 The `API_TOKEN` from env is the **master** token: full admin access.
 
 Additional **scoped** tokens can be created (via `/v1/tokens` or the console).
 A scoped token may invoke a session's `/call`, read its status, resolve its sends,
-and download its files — only for sessions its scope covers. Scope is the union of:
+download its files, and manage its own update subscriptions — only for sessions
+its scope covers. Scope is the union of:
 
 - `all_sessions` — every session, or
 - an explicit `session_ids` list, or
