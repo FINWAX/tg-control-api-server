@@ -1226,15 +1226,20 @@ type Limits struct {
 	IsPremium   *bool      `json:"is_premium,omitempty"`
 	Frozen      bool       `json:"frozen"`
 	FrozenSince *time.Time `json:"frozen_since,omitempty"`
-	SpamLimited bool       `json:"spam_limited"`
-	Cooldowns   []Cooldown `json:"cooldowns"` // active ones, soonest to end first
+	// DeletionDate and AppealLink come with Telegram's own report of a freeze:
+	// the account is deleted then unless the freeze is appealed at the link.
+	DeletionDate *time.Time `json:"deletion_date,omitempty"`
+	AppealLink   string     `json:"appeal_link,omitempty"`
+	SpamLimited  bool       `json:"spam_limited"`
+	Cooldowns    []Cooldown `json:"cooldowns"` // active ones, soonest to end first
 }
 
 // SessionLimits returns a session's account state and active cooldowns, or
 // found=false for an unknown session.
 func (s *Store) SessionLimits(ctx context.Context, id string) (l Limits, found bool, err error) {
 	err = s.pool.QueryRow(ctx,
-		`SELECT is_premium, frozen_at FROM session WHERE id=$1`, id).Scan(&l.IsPremium, &l.FrozenSince)
+		`SELECT is_premium, frozen_at, freeze_deletion_at, COALESCE(freeze_appeal_link, '')
+		 FROM session WHERE id=$1`, id).Scan(&l.IsPremium, &l.FrozenSince, &l.DeletionDate, &l.AppealLink)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return l, false, nil
 	}
@@ -1292,8 +1297,24 @@ func (s *Store) SetSessionPremium(ctx context.Context, id string, premium bool) 
 // seen) or clears the mark.
 func (s *Store) SetSessionFrozen(ctx context.Context, id string, frozen bool) error {
 	_, err := s.pool.Exec(ctx,
-		`UPDATE session SET frozen_at = CASE WHEN $2 THEN COALESCE(frozen_at, now()) END WHERE id=$1`,
+		`UPDATE session SET frozen_at = CASE WHEN $2 THEN COALESCE(frozen_at, now()) END,
+		   freeze_deletion_at = CASE WHEN $2 THEN freeze_deletion_at END,
+		   freeze_appeal_link = CASE WHEN $2 THEN freeze_appeal_link END
+		 WHERE id=$1`,
 		id, frozen)
+	return err
+}
+
+// SetSessionFreeze records a freeze as Telegram reports it: since when, when
+// the account will be deleted (zero: not said), and where to appeal.
+func (s *Store) SetSessionFreeze(ctx context.Context, id string, since, deletion time.Time, appeal string) error {
+	var del *time.Time
+	if !deletion.IsZero() {
+		del = &deletion
+	}
+	_, err := s.pool.Exec(ctx,
+		`UPDATE session SET frozen_at=$2, freeze_deletion_at=$3, freeze_appeal_link=NULLIF($4, '') WHERE id=$1`,
+		id, since, del, appeal)
 	return err
 }
 

@@ -27,6 +27,7 @@ var migrations = []migration{
 	{Version: 3, SQL: schemaV3},
 	{Version: 4, SQL: schemaV4},
 	{Version: 5, SQL: schemaV5},
+	{Version: 6, SQL: schemaV6},
 }
 
 // schemaV1 is the baseline: every table from the original unversioned bootstrap,
@@ -210,6 +211,14 @@ CREATE TABLE rate_counter (
   calls        integer NOT NULL,
   PRIMARY KEY (limit_id, bucket, window_start)
 );
+`
+
+// schemaV6 keeps what Telegram says of a frozen account besides the fact: when
+// it will be deleted unless the freeze is appealed, and where to appeal.
+const schemaV6 = `
+ALTER TABLE session
+  ADD COLUMN freeze_deletion_at timestamptz,
+  ADD COLUMN freeze_appeal_link text;
 `
 
 // applyMigrations runs every migration newer than the recorded version, in

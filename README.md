@@ -697,8 +697,10 @@ read it for their own sessions:
 
 ```jsonc
 {"is_premium": false,        // absent until TDLib reports it; never for bots
- "frozen": false,            // Telegram answered a call with FROZEN_*: read-only account
- "frozen_since": "...",      // when that was first seen
+ "frozen": false,            // the account is frozen: it may only read
+ "frozen_since": "...",      // since when
+ "deletion_date": "...",     // when Telegram deletes it unless the freeze is appealed
+ "appeal_link": "https://t.me/...",  // where to appeal
  "spam_limited": true,       // a spam_limit cooldown is running
  "cooldowns": [{"scope": "spam_limit", "until": "...", "reason": "PEER_FLOOD"}],
  "rules": [{"id": "...", "level": "session", "kind": "user", "methods": ["@join"],
@@ -711,7 +713,10 @@ read it for their own sessions:
 in one call: `{"sessions": [{<session listing fields>, "cooldowns", "rules"}]}`.
 
 The same `is_premium`, `frozen` and `spam_limited` appear in `GET /v1/sessions`
-and in the session state. `frozen` clears itself once a write goes through. A
+and in the session state. Telegram reports a freeze with its dates and appeal
+link; a call answered with `FROZEN_*` also marks the account frozen, then with
+`frozen_since` only. `frozen` clears itself when Telegram reports the freeze
+lifted or a write goes through. A
 `spam_limit` ends after 24 hours; if Telegram lifts the restriction earlier
 (after an appeal to @SpamBot), lift it here with
 `DELETE /v1/{user|bot}/{id}/limits/cooldowns/spam_limit` (master token).

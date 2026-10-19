@@ -101,6 +101,8 @@ func (m *Manager) updateHandler(ls *liveSession) client.ResultHandler {
 		switch u := result.(type) {
 		case *client.UpdateMessageSendFailed:
 			m.observeSendFailed(ls, u)
+		case *client.UpdateFreezeState:
+			m.noteFreeze(ls, u)
 		case *client.UpdateOption:
 			switch u.Name {
 			case "is_premium":

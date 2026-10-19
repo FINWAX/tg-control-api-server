@@ -922,6 +922,24 @@ func TestSessionLimits(t *testing.T) {
 		t.Errorf("unfrozen = %+v", l)
 	}
 
+	// Telegram's own report sets its dates and link; clearing drops them too.
+	since, deletion := now.Add(-time.Hour).Truncate(time.Second), now.Add(30*24*time.Hour).Truncate(time.Second)
+	must(st.SetSessionFreeze(ctx, sid, since, deletion, "https://t.me/spambot"))
+	l, _, _ = st.SessionLimits(ctx, sid)
+	if !l.Frozen || !l.FrozenSince.Equal(since) || l.DeletionDate == nil || !l.DeletionDate.Equal(deletion) || l.AppealLink != "https://t.me/spambot" {
+		t.Errorf("reported freeze = %+v", l)
+	}
+	must(st.SetSessionFrozen(ctx, sid, true)) // a FROZEN_* error keeps the report
+	l, _, _ = st.SessionLimits(ctx, sid)
+	if !l.FrozenSince.Equal(since) || l.DeletionDate == nil || l.AppealLink == "" {
+		t.Errorf("report lost to a FROZEN_* sighting: %+v", l)
+	}
+	must(st.SetSessionFrozen(ctx, sid, false))
+	l, _, _ = st.SessionLimits(ctx, sid)
+	if l.Frozen || l.DeletionDate != nil || l.AppealLink != "" {
+		t.Errorf("unfrozen after report = %+v", l)
+	}
+
 	if found, err := st.DeleteCooldown(ctx, sid, "@resolve"); err != nil || !found {
 		t.Errorf("DeleteCooldown = %v, %v; want found", found, err)
 	}

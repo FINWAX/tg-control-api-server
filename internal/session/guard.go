@@ -303,6 +303,29 @@ func (m *Manager) setFrozen(ls *liveSession, frozen bool) {
 	}()
 }
 
+// noteFreeze records the account's freeze as TDLib reports it. TDLib reports
+// it when it changes, and on start only if the account is frozen, so the
+// FROZEN_* errors and the writes that go through still keep the flag.
+func (m *Manager) noteFreeze(ls *liveSession, u *client.UpdateFreezeState) {
+	if !u.IsFrozen {
+		m.setFrozen(ls, false)
+		return
+	}
+	ls.g.mu.Lock()
+	ls.g.frozen = true
+	ls.g.mu.Unlock()
+	since, deletion := time.Unix(int64(u.FreezingDate), 0), time.Time{}
+	if u.DeletionDate > 0 {
+		deletion = time.Unix(int64(u.DeletionDate), 0)
+	}
+	log.Printf("session %s: frozen since %s, deletion %s", ls.id, since.UTC().Format(time.RFC3339), deletion.UTC().Format(time.RFC3339))
+	go func() {
+		if err := m.st.SetSessionFreeze(context.Background(), ls.id, since, deletion, u.AppealLink); err != nil {
+			log.Printf("session %s: record freeze: %v", ls.id, err)
+		}
+	}()
+}
+
 // notePremium records the account's Premium flag as TDLib reports it.
 func (m *Manager) notePremium(ls *liveSession, v client.OptionValue) {
 	b, _ := v.(*client.OptionValueBoolean) // optionValueEmpty: not Premium

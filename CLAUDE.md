@@ -97,8 +97,9 @@ X-Tgcontrol-Token-Id, который gateway всегда перезаписыв
 Защита аккаунтов (internal/session/guard.go) - только user-сессии, по сигналам
 Telegram, без угадывания чисел: 429 "retry after N" охлаждает группу метода на
 N секунд, PEER_FLOOD - spam_limit на 24 ч (запись только взаимным контактам),
-FROZEN_* - флаг frozen. Пишущие группы - темп ~1/с на сессию, ожидание >10 с -
-отказ. Отказ шлюза - 429 source:gateway code:rate_limited + details. Охлаждения -
+FROZEN_* и updateFreezeState - флаг frozen (апдейт даёт ещё deletion_date и
+appeal_link; при старте TDLib шлёт его, только если аккаунт заморожен).
+Пишущие группы - темп ~1/с на сессию, ожидание >10 с - отказ. Отказ шлюза - 429 source:gateway code:rate_limited + details. Охлаждения -
 в памяти воркера и в таблице cooldown (переживают переезд сессии). TDLib сам
 пережидает флуд до 60 с, поэтому /call может отвечать до минуты.
 Квоты (internal/quota - политика, session/limits.go - учёт, router/limits.go -
