@@ -5,34 +5,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FINWAX/tg-control-api-server/internal/quota"
 	"github.com/FINWAX/tg-control-api-server/internal/store"
 	"github.com/FINWAX/tg-control-api-server/internal/tdjson"
 )
 
-func TestMethodScope(t *testing.T) {
-	cases := map[string]string{
-		"sendMessage":         "@send",
-		"forwardMessages":     "@send",
-		"searchPublicChat":    "@resolve",
-		"checkChatInviteLink": "@resolve",
-		"getChatHistory":      "@history",
-		"getMe":               "getMe", // outside every group: its own scope
-		"sendChatAction":      "sendChatAction",
-	}
-	for method, want := range cases {
-		if got := methodScope(method); got != want {
-			t.Errorf("methodScope(%q) = %q, want %q", method, got, want)
-		}
-	}
-}
-
 func TestPacedGroupsAreGroups(t *testing.T) {
-	groups := map[string]bool{}
-	for _, g := range methodGroups {
-		groups[g] = true
-	}
 	for g := range pacedGroups {
-		if !groups[g] {
+		if !quota.IsGroup(g) {
 			t.Errorf("paced group %q has no methods", g)
 		}
 	}

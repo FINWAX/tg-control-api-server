@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/FINWAX/tg-control-api-server/internal/session"
+	"github.com/FINWAX/tg-control-api-server/internal/store"
 	"github.com/FINWAX/tg-control-api-server/internal/tdjson"
 )
 
@@ -81,5 +82,30 @@ func TestWriteCallErrRefused(t *testing.T) {
 	if e.Details["source"] != "cooldown" || e.Details["scope"] != "@resolve" ||
 		e.Details["error"] != "Too Many Requests: retry after 3600" {
 		t.Errorf("details = %v", e.Details)
+	}
+}
+
+func TestWriteCallErrLimit(t *testing.T) {
+	label := "joins per day"
+	rec := httptest.NewRecorder()
+	writeCallErr(rec, &session.RefusedError{Reason: "limit", Until: time.Now().Add(time.Hour),
+		Limit: &store.Limit{ID: "L1", Level: "session", Methods: []string{"@join"}, Max: 10, Per: "day", Label: &label}})
+	var body struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	d := body.Error.Details
+	if rec.Code != http.StatusTooManyRequests || body.Error.Code != "rate_limited" ||
+		d["source"] != "limit" || d["level"] != "session" || d["limit_id"] != "L1" || d["scope"] != nil {
+		t.Errorf("status %d error %+v", rec.Code, body.Error)
+	}
+	if want := `session limit "joins per day": 10 per day (@join)`; body.Error.Message != want {
+		t.Errorf("message = %q, want %q", body.Error.Message, want)
 	}
 }

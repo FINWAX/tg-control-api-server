@@ -20,6 +20,7 @@ import (
 
 	"github.com/zelenin/go-tdlib/client"
 
+	"github.com/FINWAX/tg-control-api-server/internal/quota"
 	"github.com/FINWAX/tg-control-api-server/internal/secret"
 	"github.com/FINWAX/tg-control-api-server/internal/store"
 	"github.com/FINWAX/tg-control-api-server/internal/tdjson"
@@ -327,6 +328,8 @@ type Manager struct {
 
 	pendMu  sync.Mutex
 	pending map[int64][]string // temp message id -> upload dirs to delete once sent
+
+	rules ruleCache // the operator's rate limits, as last read (see limits.go)
 }
 
 // worker coordination cadence.
@@ -1055,7 +1058,7 @@ func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMe
 	}
 
 	// Cooldown first: a refused call should not spend a username resolve.
-	scope := methodScope(method)
+	scope := quota.Scope(method)
 	if err := checkCooldown(ls, scope); err != nil {
 		return nil, err
 	}
@@ -1063,7 +1066,7 @@ func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMe
 	if err != nil {
 		return nil, err
 	}
-	if err := m.admit(ctx, ls, cl, scope, params); err != nil {
+	if err := m.admit(ctx, ls, cl, method, scope, params); err != nil {
 		return nil, err
 	}
 
@@ -1119,6 +1122,9 @@ func (m *Manager) resolveChatUsername(ctx context.Context, ls *liveSession, cl *
 		return nil, err
 	}
 	q, _ := json.Marshal(map[string]any{"username": uname})
+	if err := m.admit(ctx, ls, cl, "searchPublicChat", "@resolve", q); err != nil {
+		return nil, err
+	}
 	res, err := tdjson.Call(ctx, cl, "searchPublicChat", q)
 	logFloodWait(ls.id, "searchPublicChat", err)
 	m.observe(ls, "@resolve", err)

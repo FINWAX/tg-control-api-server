@@ -31,62 +31,32 @@ const (
 	spamLimitCooldown = 24 * time.Hour   // how long a PEER_FLOOD restricts the account
 )
 
-// methodGroups gathers the td_api methods Telegram limits together. A cooldown
-// covers the whole group; a method outside every group is its own scope.
-var methodGroups = map[string]string{
-	"sendMessage":                  "@send",
-	"sendMessageAlbum":             "@send",
-	"forwardMessages":              "@send",
-	"resendMessages":               "@send",
-	"sendInlineQueryResultMessage": "@send",
-	"joinChat":                     "@join",
-	"joinChatByInviteLink":         "@join",
-	"addChatMember":                "@invite",
-	"addChatMembers":               "@invite",
-	"searchPublicChat":             "@resolve",
-	"searchPublicChats":            "@resolve",
-	"searchUserByPhoneNumber":      "@resolve",
-	"checkChatInviteLink":          "@resolve",
-	"importContacts":               "@contacts",
-	"addContact":                   "@contacts",
-	"createNewSupergroupChat":      "@create",
-	"createNewBasicGroupChat":      "@create",
-	"addMessageReaction":           "@react",
-	"setMessageReactions":          "@react",
-	"viewMessages":                 "@view",
-	"getChatHistory":               "@history",
-	"searchChatMessages":           "@history",
-	"deleteMessages":               "@delete",
-	"deleteChatHistory":            "@delete",
-	"getSupergroupMembers":         "@members",
-	"searchChatMembers":            "@members",
-}
-
 // pacedGroups are the writes Telegram's anti-spam watches; they are paced, and
 // one going through shows the account is not frozen.
 var pacedGroups = map[string]bool{
 	"@send": true, "@join": true, "@invite": true, "@create": true, "@contacts": true,
 }
 
-// methodScope returns the cooldown scope of a method: its group, or itself.
-func methodScope(method string) string {
-	if g, ok := methodGroups[method]; ok {
-		return g
-	}
-	return method
-}
-
 // RefusedError is a call the guard stopped before it reached Telegram.
 type RefusedError struct {
-	Reason string    // "cooldown" or "pace"
-	Scope  string    // the cooldown scope, or the paced group
-	Until  time.Time // when the call may be tried again
-	Cause  string    // Telegram's error that started the cooldown; "" for pace
+	Reason string       // "cooldown", "pace" or "limit"
+	Scope  string       // the cooldown scope, or the paced group; "" for limit
+	Until  time.Time    // when the call may be tried again
+	Cause  string       // Telegram's error that started the cooldown; "" otherwise
+	Limit  *store.Limit // the operator's rule that ran out; only for limit
 }
 
 func (e *RefusedError) Error() string {
-	if e.Reason == "pace" {
+	switch e.Reason {
+	case "pace":
 		return fmt.Sprintf("too many %s calls queued on this session", e.Scope)
+	case "limit":
+		l := e.Limit
+		name := l.ID
+		if l.Label != nil && *l.Label != "" {
+			name = *l.Label
+		}
+		return fmt.Sprintf("%s limit %q: %d per %s (%s)", l.Level, name, l.Max, l.Per, strings.Join(l.Methods, ", "))
 	}
 	return fmt.Sprintf("%s is cooling down: %s", e.Scope, e.Cause)
 }
@@ -184,22 +154,27 @@ func checkCooldown(ls *liveSession, scope string) error {
 	return &RefusedError{Reason: "cooldown", Scope: scope, Until: c.Until, Cause: c.Reason}
 }
 
-// admit applies the account restriction and the write pace to a call that is
-// about to go out; params must already carry a numeric chat_id.
-func (m *Manager) admit(ctx context.Context, ls *liveSession, cl *client.Client, scope string, params json.RawMessage) error {
-	if ls.kind != "user" {
-		return nil
+// admit applies the account restriction, the operator's limits and the write
+// pace to a call that is about to go out; params must already carry a numeric
+// chat_id. A call it refuses spends no quota.
+func (m *Manager) admit(ctx context.Context, ls *liveSession, cl *client.Client, method, scope string, params json.RawMessage) error {
+	if ls.kind == "user" {
+		if c, ok := ls.g.active(store.SpamLimitScope, time.Now()); ok && m.spamBlocked(ctx, ls, cl, scope, params) {
+			log.Printf("call %s: refused %s, account spam-limited until %s", ls.id, scope, c.Until.UTC().Format(time.RFC3339))
+			return &RefusedError{Reason: "cooldown", Scope: store.SpamLimitScope, Until: c.Until, Cause: c.Reason}
+		}
 	}
-	if c, ok := ls.g.active(store.SpamLimitScope, time.Now()); ok && m.spamBlocked(ctx, ls, cl, scope, params) {
-		log.Printf("call %s: refused %s, account spam-limited until %s", ls.id, scope, c.Until.UTC().Format(time.RFC3339))
-		return &RefusedError{Reason: "cooldown", Scope: store.SpamLimitScope, Until: c.Until, Cause: c.Reason}
+	release, err := m.takeQuota(ctx, ls, method, params)
+	if err != nil {
+		return err
 	}
-	if !pacedGroups[scope] {
+	if ls.kind != "user" || !pacedGroups[scope] {
 		return nil
 	}
 	now := time.Now()
 	wait, ok := ls.g.reserve(now)
 	if !ok {
+		release()
 		log.Printf("call %s: refused %s, pace queue full", ls.id, scope)
 		return &RefusedError{Reason: "pace", Scope: scope, Until: now.Add(wait - maxPaceWait)}
 	}
@@ -210,6 +185,7 @@ func (m *Manager) admit(ctx context.Context, ls *liveSession, cl *client.Client,
 	case <-time.After(wait):
 		return nil
 	case <-ctx.Done():
+		release()
 		return ctx.Err()
 	}
 }

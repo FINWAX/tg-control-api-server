@@ -941,3 +941,100 @@ func TestSessionLimits(t *testing.T) {
 		t.Errorf("cooldowns outlived their session: %d", n)
 	}
 }
+
+func TestLimitsAndCounters(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	sid := mkAuthorizedSession(t, st, mkApp(t, st, "a"), "user", "/d/quota")
+	kind := "user"
+
+	if _, err := st.CreateLimit(ctx, Limit{Level: "session", SessionID: ptr("00000000-0000-0000-0000-000000000000"),
+		Methods: []string{"@join"}, Max: 1, Per: "day", Enabled: true}); err != ErrLimitTarget {
+		t.Errorf("unknown session: err %v, want ErrLimitTarget", err)
+	}
+	def, err := st.CreateLimit(ctx, Limit{Level: "session", Kind: &kind, Methods: []string{"@join"}, Max: 3, Per: "day", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	own, err := st.CreateLimit(ctx, Limit{Level: "session", SessionID: &sid, Methods: []string{"@send"}, Max: 5, Per: "hour", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now().Truncate(time.Hour)
+	use := func(l *Limit, n int) CounterUse {
+		return CounterUse{Key: CounterKey{LimitID: l.ID, Bucket: sid, WindowStart: start}, N: n, Max: l.Max}
+	}
+	take := func(uses ...CounterUse) int {
+		t.Helper()
+		i, err := st.TakeCounters(ctx, uses)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return i
+	}
+	counts := func() (int, int) {
+		t.Helper()
+		c, err := st.Counters(ctx, []CounterKey{use(def, 0).Key, use(own, 0).Key})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c[use(def, 0).Key], c[use(own, 0).Key]
+	}
+
+	if i := take(use(def, 2), use(own, 4)); i != -1 {
+		t.Fatalf("first take refused at %d", i)
+	}
+	// The second use would overfill: neither is counted.
+	if i := take(use(def, 1), use(own, 2)); i != 1 {
+		t.Errorf("overfill refused at %d, want 1", i)
+	}
+	if d, o := counts(); d != 2 || o != 4 {
+		t.Errorf("after refusal: %d, %d; want 2, 4 (all or nothing)", d, o)
+	}
+	// A single use larger than the whole window never fits.
+	if i := take(use(def, 4)); i != 0 {
+		t.Errorf("oversized use refused at %d, want 0", i)
+	}
+	if i := take(use(def, 1)); i != -1 {
+		t.Errorf("exact fit refused at %d", i)
+	}
+	if err := st.GiveBackCounters(ctx, []CounterUse{use(def, 2), use(own, 9)}); err != nil {
+		t.Fatal(err)
+	}
+	if d, o := counts(); d != 1 || o != 0 {
+		t.Errorf("after give back: %d, %d; want 1, 0 (never below zero)", d, o)
+	}
+	if n, err := st.MaxCounter(ctx, def.ID, start); err != nil || n != 1 {
+		t.Errorf("MaxCounter = %d, %v", n, err)
+	}
+
+	off := false
+	own.Max, own.Enabled = 50, off
+	if u, err := st.UpdateLimit(ctx, *own); err != nil || u.Max != 50 || u.Enabled {
+		t.Errorf("UpdateLimit = %+v, %v", u, err)
+	}
+	if l, err := st.GetLimit(ctx, "00000000-0000-0000-0000-000000000000"); l != nil || err != nil {
+		t.Errorf("GetLimit unknown = %v, %v", l, err)
+	}
+	if n, err := st.PurgeCounters(ctx, start.Add(time.Second)); err != nil || n != 2 {
+		t.Errorf("PurgeCounters = %d, %v; want 2", n, err)
+	}
+
+	// Removing the session takes its own rules with it, and their counters.
+	take(use(own, 1))
+	if _, _, err := st.DeleteSession(ctx, sid); err != nil {
+		t.Fatal(err)
+	}
+	if l, _ := st.GetLimit(ctx, own.ID); l != nil {
+		t.Error("session's own rule outlived it")
+	}
+	if found, err := st.DeleteLimit(ctx, def.ID); err != nil || !found {
+		t.Errorf("DeleteLimit = %v, %v", found, err)
+	}
+	if n := countRows(t, st, `SELECT count(*) FROM rate_counter`); n != 0 {
+		t.Errorf("counters left: %d", n)
+	}
+}
+
+func ptr(s string) *string { return &s }

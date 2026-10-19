@@ -86,6 +86,12 @@ func (m *Manager) purgeOnce() {
 	} else if n > 0 {
 		log.Printf("retention: purged %d ended cooldowns", n)
 	}
+	// A week's window is the longest a rule counts in.
+	if n, err := m.st.PurgeCounters(ctx, time.Now().AddDate(0, 0, -8)); err != nil {
+		log.Printf("retention: limit counters: %v", err)
+	} else if n > 0 {
+		log.Printf("retention: purged %d limit counters", n)
+	}
 	m.sweepUploads()
 }
 

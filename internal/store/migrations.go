@@ -26,6 +26,7 @@ var migrations = []migration{
 	{Version: 2, SQL: schemaV2},
 	{Version: 3, SQL: schemaV3},
 	{Version: 4, SQL: schemaV4},
+	{Version: 5, SQL: schemaV5},
 }
 
 // schemaV1 is the baseline: every table from the original unversioned bootstrap,
@@ -181,6 +182,33 @@ CREATE TABLE cooldown (
   reason     text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (session_id, scope)
+);
+`
+
+// schemaV5 adds the operator's rate limits, as VK-Control has them: a rule
+// caps the calls of some methods per window, for every session of a kind, one
+// session, or a consumer token on each of its sessions. Counters are kept per
+// rule, session and window.
+const schemaV5 = `
+CREATE TABLE rate_limit (
+  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  level      text NOT NULL CHECK (level IN ('session','token')),
+  kind       text CHECK (kind IN ('user','bot')),
+  session_id uuid REFERENCES session(id) ON DELETE CASCADE,
+  token_id   uuid REFERENCES api_token(id) ON DELETE CASCADE,
+  methods    text[] NOT NULL,
+  max_calls  integer NOT NULL CHECK (max_calls > 0),
+  per        text NOT NULL CHECK (per IN ('minute','hour','day','week')),
+  label      text,
+  enabled    boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE rate_counter (
+  limit_id     uuid NOT NULL REFERENCES rate_limit(id) ON DELETE CASCADE,
+  bucket       text NOT NULL,
+  window_start timestamptz NOT NULL,
+  calls        integer NOT NULL,
+  PRIMARY KEY (limit_id, bucket, window_start)
 );
 `
 

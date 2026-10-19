@@ -106,16 +106,21 @@ func writeCallErr(w http.ResponseWriter, err error) {
 	writeErr(w, http.StatusBadGateway, err.Error())
 }
 
-// writeRefused renders a call the guard stopped before it reached Telegram,
+// writeRefused renders a call the guard stopped before it reached Telegram
+// (a cooldown, the write pace, or an operator's limit),
 // in the shape VK-Control uses for the same refusal: a gateway 429 with code
 // "rate_limited", the wait, and details naming what stopped it.
 func writeRefused(w http.ResponseWriter, re *session.RefusedError) {
 	secs := max(re.RetryAfter(), 1)
-	details := map[string]any{
-		"source": re.Reason, "scope": re.Scope, "until": re.Until.UTC(), "retry_after": secs,
+	details := map[string]any{"source": re.Reason, "until": re.Until.UTC(), "retry_after": secs}
+	if re.Scope != "" {
+		details["scope"] = re.Scope
 	}
 	if re.Cause != "" {
 		details["error"] = re.Cause
+	}
+	if re.Limit != nil {
+		details["level"], details["limit_id"] = re.Limit.Level, re.Limit.ID
 	}
 	w.Header().Set("Retry-After", strconv.Itoa(secs))
 	w.Header().Set("Content-Type", "application/json")
@@ -398,7 +403,9 @@ func (s *Server) handleCall(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "method reserved by the gateway")
 		return
 	}
-	result, err := s.mgr.Call(r.Context(), r.PathValue("id"), req.Method, req.Params)
+	// The caller's own token rules count this call (see session/limits.go).
+	ctx := session.WithConsumer(r.Context(), r.Header.Get(tokenIDHeader))
+	result, err := s.mgr.Call(ctx, r.PathValue("id"), req.Method, req.Params)
 	if err != nil {
 		if errors.Is(err, session.ErrLocalPathDenied) {
 			writeErr(w, http.StatusForbidden, err.Error())

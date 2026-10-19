@@ -78,6 +78,12 @@ func New(st *store.Store, stale time.Duration, token string, uploads *upload.Sto
 	mux.HandleFunc("GET /v1/bot/{id}/sends", rt.getSend)
 	mux.HandleFunc("GET /v1/user/{id}/limits", rt.getLimits)
 	mux.HandleFunc("GET /v1/bot/{id}/limits", rt.getLimits)
+	mux.HandleFunc("GET /v1/me/limits", rt.myLimits)
+	mux.HandleFunc("POST /v1/limits", rt.createLimit)
+	mux.HandleFunc("GET /v1/limits", rt.listLimits)
+	mux.HandleFunc("GET /v1/limits/{id}", rt.getLimit)
+	mux.HandleFunc("PATCH /v1/limits/{id}", rt.updateLimit)
+	mux.HandleFunc("DELETE /v1/limits/{id}", rt.deleteLimit)
 	mux.HandleFunc("GET /v1/user/{id}/updates/subscriptions", rt.listSubscriptions)
 	mux.HandleFunc("GET /v1/bot/{id}/updates/subscriptions", rt.listSubscriptions)
 	mux.HandleFunc("GET /v1/user/{id}/updates/subscriptions/{sub}", rt.getSubscription)
@@ -190,7 +196,8 @@ func (rt *Router) auth(next http.Handler) http.Handler {
 		// listSessions), so it reveals nothing the token cannot already address.
 		// It exists so an integrator can discover full session ids and kinds
 		// without being handed the master token.
-		if r.Method == http.MethodGet && r.URL.Path == "/v1/sessions" {
+		// Likewise /v1/me/limits covers only the token's own sessions.
+		if r.Method == http.MethodGet && (r.URL.Path == "/v1/sessions" || r.URL.Path == "/v1/me/limits") {
 			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), tokenIDKey{}, id)))
 			return
 		}
@@ -339,14 +346,16 @@ func (rt *Router) getSend(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, out)
 }
 
-// getLimits reports what Telegram has said about a session's account and the
-// cooldowns the gateway holds it to. Served from the registry, so it answers
-// while the session is unhosted too.
+// getLimits reports what holds a session back: what Telegram has said about
+// its account, the cooldowns the gateway holds it to, and the operator's rules
+// bearing on it for this caller, with usage. Served from the registry, so it
+// answers while the session is unhosted too.
 func (rt *Router) getLimits(w http.ResponseWriter, r *http.Request) {
 	if _, ok := rt.resolveSession(w, r); !ok {
 		return
 	}
-	l, found, err := rt.st.SessionLimits(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	l, found, err := rt.st.SessionLimits(r.Context(), id)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -355,7 +364,20 @@ func (rt *Router) getLimits(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "session not found")
 		return
 	}
-	writeOK(w, l)
+	all, err := rt.st.ListLimits(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	rules, err := rt.sessionRules(r.Context(), all, id, pathKind(r.URL.Path), tokenOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeOK(w, struct {
+		store.Limits
+		Rules []ruleView `json:"rules"`
+	}{l, rules})
 }
 
 // --- update subscriptions ---
