@@ -55,13 +55,16 @@ type Error struct {
 
 func (e *Error) Error() string { return fmt.Sprintf("tdlib %d: %s", e.Code, e.Message) }
 
-// RetryAfter returns the seconds TDLib asks the caller to wait after a
-// FLOOD_WAIT ("Too Many Requests: retry after N", code 420), or ok=false for
-// any other error. The number is only ever carried in the message text, so
-// parsing it here keeps that knowledge with the error type instead of spread
-// across the callers that need to honour or surface the wait.
+// RetryAfter returns the seconds TDLib asks the caller to wait after a flood
+// wait, or ok=false for any other error. TDLib absorbs Telegram's 420
+// FLOOD_WAIT_N itself, waiting and resending, and only hands the application
+// 429 "Too Many Requests: retry after N" once the total wait exceeds its limit
+// (60 s by default); a raw 420 is accepted too in case one ever slips through.
+// The number is only ever carried in the message text, so parsing it here
+// keeps that knowledge with the error type instead of spread across the
+// callers that need to honour or surface the wait.
 func (e *Error) RetryAfter() (int, bool) {
-	if e.Code != 420 {
+	if e.Code != 429 && e.Code != 420 {
 		return 0, false
 	}
 	const marker = "retry after "

@@ -327,14 +327,6 @@ const (
 	staleLoginGrace   = 2 * time.Minute  // grace before an ownerless login is written off
 )
 
-// flood-wait auto-retry bounds: TDLib FLOOD_WAIT (code 420) asks the caller to
-// wait N seconds. Short waits are absorbed transparently; longer ones surface as
-// a structured error so the client decides.
-const (
-	maxAutoFloodWaitSec = 5 // only auto-retry flood-waits up to this many seconds
-	maxFloodRetries     = 2 // max transparent flood-wait retries per call
-)
-
 func NewManager(st *store.Store, sec *secret.Box, dataDir, workerID, selfAddr string, capacity int, uploadsDir string, uploadTTL, sendTTL time.Duration) *Manager {
 	m := &Manager{
 		st: st, sec: sec, dataDir: dataDir,
@@ -1025,8 +1017,8 @@ func IsBlockedMethod(method string) bool { return blockedMethods[method] }
 // manual resolve/access_hash step; (2) a "Chat not found" force-loads the chat
 // and retries once, since TDLib lazy-loads dialogs — for every peer type, not
 // just private chats (see forceLoadChat), so callers need not know the chat_id
-// encoding. Short FLOOD_WAIT errors are retried transparently; longer ones
-// surface as a structured error.
+// encoding. Flood waits are not retried here: TDLib already sits out the short
+// ones (up to 60 s, which is how long a call may hang) and returns the rest.
 func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMessage) (json.RawMessage, error) {
 	ls := m.get(id)
 	if ls == nil {
@@ -1049,15 +1041,16 @@ func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMe
 		return nil, err
 	}
 
-	res, err := m.sendWithFloodRetry(ctx, cl, method, params)
+	res, err := tdjson.Call(ctx, cl, method, params)
 	if err != nil && isChatUnresolved(err) {
 		if loadMethod, loadParams, ok := forceLoadChat(params); ok {
 			if _, e := tdjson.Call(ctx, cl, loadMethod, loadParams); e == nil {
 				log.Printf("call %s: force-loaded chat via %s, retrying %s", id, loadMethod, method)
-				res, err = m.sendWithFloodRetry(ctx, cl, method, params)
+				res, err = tdjson.Call(ctx, cl, method, params)
 			}
 		}
 	}
+	logFloodWait(id, method, err)
 	if err == nil {
 		if len(uploadDirs) > 0 {
 			m.trackUpload(res, uploadDirs)
@@ -1069,35 +1062,16 @@ func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMe
 	return res, err
 }
 
-// sendWithFloodRetry dispatches a method, transparently retrying short
-// FLOOD_WAIT (code 420) responses after the wait TDLib requests.
-func (m *Manager) sendWithFloodRetry(ctx context.Context, cl *client.Client, method string, params json.RawMessage) (json.RawMessage, error) {
-	for attempt := 0; ; attempt++ {
-		res, err := tdjson.Call(ctx, cl, method, params)
-		if err == nil {
-			return res, nil
-		}
-		secs, ok := floodWaitSeconds(err)
-		if !ok || secs > maxAutoFloodWaitSec || attempt >= maxFloodRetries {
-			return res, err
-		}
-		log.Printf("call %s: FLOOD_WAIT %ds, retrying (attempt %d)", method, secs, attempt+1)
-		select {
-		case <-time.After(time.Duration(secs) * time.Second):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-}
-
-// floodWaitSeconds returns the retry-after seconds of a TDLib FLOOD_WAIT error
-// ("Too Many Requests: retry after N"), or ok=false for anything else.
-func floodWaitSeconds(err error) (int, bool) {
+// logFloodWait records a flood wait the call ran into, with TDLib's own code
+// and text, so the operator sees which session and method Telegram throttled.
+func logFloodWait(id, method string, err error) {
 	var te *tdjson.Error
 	if !errors.As(err, &te) {
-		return 0, false
+		return
 	}
-	return te.RetryAfter()
+	if secs, ok := te.RetryAfter(); ok {
+		log.Printf("call %s %s: flood wait %ds (tdlib %d: %s)", id, method, secs, te.Code, te.Message)
+	}
 }
 
 // resolveChatUsername rewrites a string chat_id ("@name" or "name") to the

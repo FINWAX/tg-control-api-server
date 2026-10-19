@@ -113,24 +113,6 @@ func TestIsChatUnresolved(t *testing.T) {
 	}
 }
 
-func TestFloodWaitSeconds(t *testing.T) {
-	if n, ok := floodWaitSeconds(&tdjson.Error{Code: 420, Message: "Too Many Requests: retry after 5"}); !ok || n != 5 {
-		t.Errorf("flood 5 = (%d, %v)", n, ok)
-	}
-	if n, ok := floodWaitSeconds(&tdjson.Error{Code: 420, Message: "Too Many Requests: retry after 300"}); !ok || n != 300 {
-		t.Errorf("flood 300 = (%d, %v)", n, ok)
-	}
-	if _, ok := floodWaitSeconds(&tdjson.Error{Code: 420, Message: "no number here"}); ok {
-		t.Error("unparseable 420 should be ok=false")
-	}
-	if _, ok := floodWaitSeconds(&tdjson.Error{Code: 400, Message: "retry after 5"}); ok {
-		t.Error("non-420 code should be ok=false")
-	}
-	if _, ok := floodWaitSeconds(errors.New("plain error")); ok {
-		t.Error("non-tdlib error should be ok=false")
-	}
-}
-
 func TestCollectLocalFilePaths(t *testing.T) {
 	// nested inputFileLocal in a sendMessage photo + a thumbnail
 	params := json.RawMessage(`{

@@ -81,7 +81,7 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 // writeCallErr renders a td_api dispatch error. A TDLib error becomes a
 // structured envelope ({code, message, source:"tdlib"}) with an HTTP status
 // mapped from the TDLib code; anything else falls back to a 502 gateway error.
-// A FLOOD_WAIT additionally carries the wait both as error.retry_after and as
+// A flood wait additionally carries the wait both as error.retry_after and as
 // the standard Retry-After header, so clients need not parse the message.
 func writeCallErr(w http.ResponseWriter, err error) {
 	var te *tdjson.Error
@@ -128,7 +128,8 @@ func writeConflict(w http.ResponseWriter, msg, sessionID string) {
 }
 
 // httpStatusForTd maps a TDLib error code to an HTTP status. TDLib codes largely
-// mirror HTTP (400/401/403/404/…); 420 is FLOOD_WAIT (rate limit).
+// mirror HTTP (400/401/403/404/…), including 429 for a flood wait; a raw 420
+// FLOOD_WAIT, which TDLib normally absorbs itself, maps to 429 as well.
 func httpStatusForTd(code int) int {
 	switch {
 	case code == 0:

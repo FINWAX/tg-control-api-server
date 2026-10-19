@@ -253,14 +253,20 @@ Success is `{"ok": true, "result": ...}`. Failure is:
   "message": "Chat not found",  // human-readable, from TDLib or this service
   "source": "tdlib",            // "tdlib" = Telegram refused; "gateway" = this service
   "code": 400,                  // TDLib error code — present only when source is "tdlib"
-  "retry_after": 30             // seconds; only on FLOOD_WAIT (code 420), also sent as Retry-After
+  "retry_after": 3600           // seconds; only on a flood wait (code 429), also sent as Retry-After
 }}
 ```
 
 `source` is the field to branch on: `"gateway"` means the request never reached
 Telegram (bad input, unknown session, no live worker) and is often retryable as
 is; `"tdlib"` means Telegram itself rejected it. The HTTP status mirrors `code`
-for TDLib errors, with `420` (FLOOD_WAIT) mapped to `429`.
+for TDLib errors.
+
+**A call may take up to a minute.** TDLib sits out Telegram's short flood waits
+itself, resending once the wait is over, as long as the total stays within 60
+seconds; the call simply answers late. A longer wait comes back as `429` with
+`retry_after`. Give `/call` a client timeout of at least 75 seconds, so a call
+TDLib is still waiting out is not abandoned and repeated.
 
 Note that TDLib packs most refusals into `code: 400` regardless of cause, so
 distinguishing e.g. *Chat not found* from *CHANNEL_PRIVATE* still requires

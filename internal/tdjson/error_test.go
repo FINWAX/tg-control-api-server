@@ -36,10 +36,11 @@ func TestErrorRetryAfter(t *testing.T) {
 		want int
 		ok   bool
 	}{
-		{420, "Too Many Requests: retry after 5", 5, true},
-		{420, "Too Many Requests: retry after 300", 300, true},
-		{420, "no number here", 0, false},
-		{400, "retry after 5", 0, false}, // only FLOOD_WAIT carries a wait
+		{429, "Too Many Requests: retry after 61", 61, true}, // what TDLib actually returns
+		{429, "Too Many Requests: retry after 52733", 52733, true},
+		{420, "Too Many Requests: retry after 5", 5, true}, // raw FLOOD_WAIT, fallback
+		{429, "no number here", 0, false},
+		{400, "retry after 5", 0, false}, // only a flood wait carries a wait
 		{0, "", 0, false},
 	}
 	for _, c := range cases {
