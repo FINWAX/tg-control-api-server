@@ -233,7 +233,9 @@ Every request except `GET /healthz` must carry `Authorization: Bearer <token>`.
 | `PATCH/GET /v1/files/{id}`, `POST /v1/files/{id}/complete`, `DELETE /v1/files/{id}` | Resumable/chunked upload |
 | `GET /v1/{user\|bot}/{id}/files/{file_id}` | Download a file, streamed with Range (see [Downloading files](#downloading-files-crawling)) |
 | `POST/GET /v1/{user\|bot}/{id}/updates/subscriptions`, `GET/DELETE .../subscriptions/{sub}` | Update webhooks (see [Receiving updates](#receiving-updates)) |
-| `GET  /v1/{user\|bot}/{id}` | Session state → `{id, status, code_info?, last_error?}` |
+| `GET  /v1/{user\|bot}/{id}` | Session state → `{id, status, code_info?, last_error?, is_premium?, frozen, spam_limited}` |
+| `GET /v1/{user\|bot}/{id}/limits` | Account flags and active cooldowns (see [Limits and cooldowns](#limits-and-cooldowns)) |
+| `DELETE /v1/{user\|bot}/{id}/limits/cooldowns/{scope}` | Lift a cooldown early (master only) |
 | `PATCH /v1/{user\|bot}/{id}` `{label?, proxy_id?}` | Rename / change proxy (applied live) |
 | `DELETE /v1/{user\|bot}/{id}` | Close and remove a session |
 | `GET  /v1/{sessions\|apps\|proxies\|workers}` | Registry listings (no secrets) |
@@ -252,15 +254,18 @@ Success is `{"ok": true, "result": ...}`. Failure is:
 {"ok": false, "error": {
   "message": "Chat not found",  // human-readable, from TDLib or this service
   "source": "tdlib",            // "tdlib" = Telegram refused; "gateway" = this service
-  "code": 400,                  // TDLib error code — present only when source is "tdlib"
-  "retry_after": 3600           // seconds; only on a flood wait (code 429), also sent as Retry-After
+  "code": 400,                  // TDLib error code when source is "tdlib"; for "gateway", only "rate_limited"
+  "retry_after": 3600,          // seconds; on a flood wait or a refusal, also sent as Retry-After
+  "details": {...}              // only with "rate_limited": what stopped the call
 }}
 ```
 
 `source` is the field to branch on: `"gateway"` means the request never reached
 Telegram (bad input, unknown session, no live worker) and is often retryable as
 is; `"tdlib"` means Telegram itself rejected it. The HTTP status mirrors `code`
-for TDLib errors.
+for TDLib errors. A `429` with `source: "gateway"` and `code: "rate_limited"` is
+the gateway holding the account back before Telegram had to; see
+[Limits and cooldowns](#limits-and-cooldowns).
 
 **A call may take up to a minute.** TDLib sits out Telegram's short flood waits
 itself, resending once the wait is over, as long as the total stays within 60
@@ -625,14 +630,83 @@ happens before an update is matched to subscriptions, so it is charged to every
 subscription the session had at the time; a non-zero `dropped` means the stream
 has a gap.
 
+## Limits and cooldowns
+
+Telegram restricts an account for how it behaves as a whole, and a session
+may serve several consumers at once. The gateway therefore holds every user
+session to what Telegram has signalled, across all its consumers. Nothing
+here guesses Telegram's numbers; bots are not held back, since their limits
+are per chat and a flood costs them only the wait.
+
+- **Cooldowns.** When Telegram makes a call wait longer than TDLib sits out
+  (the `429` with `retry_after`), the method's group cools down on that
+  session for the whole wait: Telegram's flood waits are per method, so a
+  throttled username search does not stop sending. `PEER_FLOOD` (the account
+  was reported for spam) imposes a `spam_limit` cooldown for 24 hours: sends
+  to private chats with anyone but mutual contacts (Saved Messages excepted),
+  invites and contact imports are refused. Cooldowns survive a session moving
+  to another worker.
+- **Pace.** Writes (`@send`, `@join`, `@invite`, `@create`, `@contacts`) leave a
+  session at most about once a second, whoever sends them; a write waits for its
+  turn, and one that would wait over 10 seconds is refused at once.
+
+A call stopped this way never reaches Telegram:
+
+```jsonc
+// HTTP 429, Retry-After: 3540
+{"ok": false, "error": {
+  "source": "gateway", "code": "rate_limited", "retry_after": 3540,
+  "message": "@resolve is cooling down: Too Many Requests: retry after 3600",
+  "details": {
+    "source": "cooldown",       // or "pace"
+    "scope": "@resolve",        // method group, method name, or "spam_limit"
+    "until": "2026-10-19T17:00:00Z",
+    "retry_after": 3540,
+    "error": "Too Many Requests: retry after 3600"  // Telegram's signal; not on pace
+  }}}
+```
+
+Method groups:
+
+| Group | Methods |
+|---|---|
+| `@send` | `sendMessage`, `sendMessageAlbum`, `forwardMessages`, `resendMessages`, `sendInlineQueryResultMessage` |
+| `@join` | `joinChat`, `joinChatByInviteLink` |
+| `@invite` | `addChatMember`, `addChatMembers` |
+| `@resolve` | `searchPublicChat`, `searchPublicChats`, `searchUserByPhoneNumber`, `checkChatInviteLink` — and the resolve behind a `"@username"` chat_id |
+| `@contacts` | `importContacts`, `addContact` |
+| `@create` | `createNewSupergroupChat`, `createNewBasicGroupChat` |
+| `@react` | `addMessageReaction`, `setMessageReactions` |
+| `@view` | `viewMessages` |
+| `@history` | `getChatHistory`, `searchChatMessages` |
+| `@delete` | `deleteMessages`, `deleteChatHistory` |
+| `@members` | `getSupergroupMembers`, `searchChatMembers` |
+
+`GET /v1/{user|bot}/{id}/limits` shows where a session stands; scoped tokens may
+read it for their own sessions:
+
+```jsonc
+{"is_premium": false,        // absent until TDLib reports it; never for bots
+ "frozen": false,            // Telegram answered a call with FROZEN_*: read-only account
+ "frozen_since": "...",      // when that was first seen
+ "spam_limited": true,       // a spam_limit cooldown is running
+ "cooldowns": [{"scope": "spam_limit", "until": "...", "reason": "PEER_FLOOD"}]}
+```
+
+The same `is_premium`, `frozen` and `spam_limited` appear in `GET /v1/sessions`
+and in the session state. `frozen` clears itself once a write goes through. A
+`spam_limit` ends after 24 hours; if Telegram lifts the restriction earlier
+(after an appeal to @SpamBot), lift it here with
+`DELETE /v1/{user|bot}/{id}/limits/cooldowns/spam_limit` (master token).
+
 ## API tokens
 
 The `API_TOKEN` from env is the **master** token: full admin access.
 
 Additional **scoped** tokens can be created (via `/v1/tokens` or the console).
-A scoped token may invoke a session's `/call`, read its status, resolve its sends,
-download its files, and manage its own update subscriptions — only for sessions
-its scope covers. Scope is the union of:
+A scoped token may invoke a session's `/call`, read its status and limits,
+resolve its sends, download its files, and manage its own update subscriptions —
+only for sessions its scope covers. Scope is the union of:
 
 - `all_sessions` — every session, or
 - an explicit `session_ids` list, or

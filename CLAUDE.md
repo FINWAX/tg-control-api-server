@@ -63,7 +63,10 @@ API и шифруются в БД; в .env только инфра-конфиг 
 - `GET /v1/{user|bot}/{id}/files/{file_id}[?remote_id=][&delete=1]` -> стрим файла
   с диска воркера (downloadFile synchronous, http.ServeContent + Range). Для
   краулинга; вход по локальному file_id или постоянному remote_id.
-- `GET /v1/{user|bot}/{id}` -> {id, status, code_info?, last_error?}
+- `GET /v1/{user|bot}/{id}` -> {id, status, code_info?, last_error?, is_premium?,
+  frozen, spam_limited}
+- `GET /v1/{user|bot}/{id}/limits` -> {is_premium?, frozen, spam_limited, cooldowns};
+  `DELETE .../limits/cooldowns/{scope}` - снять охлаждение (мастер)
 
 Логин-флоу восстановим: неверный код/пароль не рушит сессию (возвращается ошибка
 tdlib, статус остаётся awaiting_*), awaiting_* пишутся в реестр - вернуться в
@@ -88,6 +91,14 @@ X-Tgcontrol-Token-Id, который gateway всегда перезаписыв
 проверяются в момент выдачи доставки. Диспетчер: подписка в полёте не
 выдаётся повторно, потолок строк на подписку, приёмники параллельно. Контракт
 доставки: at-least-once, без порядка, дедуп по X-Tgcontrol-Delivery.
+
+Защита аккаунтов (internal/session/guard.go) - только user-сессии, по сигналам
+Telegram, без угадывания чисел: 429 "retry after N" охлаждает группу метода на
+N секунд, PEER_FLOOD - spam_limit на 24 ч (запись только взаимным контактам),
+FROZEN_* - флаг frozen. Пишущие группы - темп ~1/с на сессию, ожидание >10 с -
+отказ. Отказ шлюза - 429 source:gateway code:rate_limited + details. Охлаждения -
+в памяти воркера и в таблице cooldown (переживают переезд сессии). TDLib сам
+пережидает флуд до 60 с, поэтому /call может отвечать до минуты.
 
 Прокси на сессию поддерживается (addProxy), в локальном случае опционален; смысл -
 чтобы каждый из <50 аккаунтов мог ходить со своего IP. Схема БД версионируется
