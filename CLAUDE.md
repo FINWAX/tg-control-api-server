@@ -111,8 +111,11 @@ Postgres на сессию (rate_counter), всё-или-ничего в одн�
 чтобы каждый из <50 аккаунтов мог ходить со своего IP. Схема БД версионируется
 миграциями (internal/store/migrations.go), апгрейд не рушит данные.
 
-Пинованные версии (НЕ расходить): go-tdlib v1.0.0-beta1 <-> образ
-ghcr.io/zelenin/tdlib-docker:b498497-alpine (TDLib b498497).
+Пинованные версии (НЕ расходить): go-tdlib 0dd3ea6 (псевдоверсия, тега нет) <->
+образ ghcr.io/zelenin/tdlib-docker:49b3bcb-alpine (TDLib 1.8.64, 49b3bcb).
+Статические флаги go-tdlib не знают libtde2e - Dockerfile добавляет её через
+-extldflags (и в GOFLAGS для go test). Базы сессий, открытые новым TDLib,
+старым открываться не обязаны - перед апгрейдом TDLib копия тома tdlibdata.
 
 Структура: cmd/gateway (HTTP); internal/api, internal/session (воркер+
 authorizer), internal/store (Postgres), internal/secret (AES-GCM),

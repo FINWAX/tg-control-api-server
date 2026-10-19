@@ -65,8 +65,10 @@ routing + auth), `internal/session` (worker manager + authorizer + reconciler),
 - Docker + Docker Compose.
 - No local Go/Node toolchain needed — everything builds in containers.
 
-Pinned versions (do not drift): go-tdlib `v1.0.0-beta1` against image
-`ghcr.io/zelenin/tdlib-docker:b498497-alpine` (TDLib `b498497`).
+Pinned versions (do not drift): go-tdlib `0dd3ea6` against image
+`ghcr.io/zelenin/tdlib-docker:49b3bcb-alpine` (TDLib 1.8.64, `49b3bcb`). The
+td_api a session speaks is that TDLib's: see its
+[td_api.tl](https://github.com/tdlib/td/blob/49b3bcbb6bfebf2ed44dd9f25102d2e1a94a58c4/td/generate/scheme/td_api.tl).
 
 ## Setup
 

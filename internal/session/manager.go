@@ -713,10 +713,8 @@ func (m *Manager) proxyRequest(ctx context.Context, proxyID string) (*client.Add
 		return nil, fmt.Errorf("unknown proxy type %q", p.Type)
 	}
 	return &client.AddProxyRequest{
-		Server: p.Host,
-		Port:   p.Port,
+		Proxy:  &client.Proxy{Server: p.Host, Port: p.Port, Type: pt},
 		Enable: true,
-		Type:   pt,
 	}, nil
 }
 

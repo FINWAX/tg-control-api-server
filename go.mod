@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/jackc/pgx/v5 v5.6.0
-	github.com/zelenin/go-tdlib v1.0.0-beta1
+	github.com/zelenin/go-tdlib v1.0.0-beta1.0.20260509025013-0dd3ea652682
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.69.0
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc v0.20.0

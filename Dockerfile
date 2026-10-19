@@ -1,6 +1,6 @@
-# Prebuilt TDLib matching go-tdlib v1.0.0-beta1 (TDLib commit 49b3bcb).
+# Prebuilt TDLib matching go-tdlib 0dd3ea6 (TDLib commit 49b3bcb).
 # Maintained by the go-tdlib author, so the td_api schemas line up.
-FROM ghcr.io/zelenin/tdlib-docker:b498497-alpine AS tdlib
+FROM ghcr.io/zelenin/tdlib-docker:49b3bcb-alpine AS tdlib
 
 FROM golang:1.25-alpine3.21 AS go-builder
 
@@ -14,11 +14,16 @@ COPY --from=tdlib /usr/local/lib/libtd* /usr/local/lib/
 
 COPY . /src
 
-# go-tdlib links libtdjson statically by default (see client/tdjson_static.go).
+# go-tdlib links libtdjson statically by default (see client/tdjson_static.go),
+# but its flags predate libtde2e, which TDLib's core needs since 2025; it goes
+# at the end of the link line, with the libraries it uses itself. GOFLAGS
+# carries it to go test as well.
+ENV TD_EXTLDFLAGS=-extldflags=-Wl,-ltde2e,-ltdutils,-lstdc++,-lssl,-lcrypto
+ENV GOFLAGS=-ldflags=$TD_EXTLDFLAGS
 RUN go mod tidy && \
-    go build -trimpath -ldflags "-s -w" -o /out/gateway ./cmd/gateway && \
-    go build -trimpath -ldflags "-s -w" -o /out/worker ./cmd/worker && \
-    go build -trimpath -ldflags "-s -w" -o /out/smoke ./cmd/smoke
+    go build -trimpath -ldflags "-s -w $TD_EXTLDFLAGS" -o /out/gateway ./cmd/gateway && \
+    go build -trimpath -ldflags "-s -w $TD_EXTLDFLAGS" -o /out/worker ./cmd/worker && \
+    go build -trimpath -ldflags "-s -w $TD_EXTLDFLAGS" -o /out/smoke ./cmd/smoke
 
 FROM alpine:3.21
 
