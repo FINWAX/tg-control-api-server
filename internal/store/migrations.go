@@ -25,6 +25,7 @@ var migrations = []migration{
 	{Version: 1, SQL: schemaV1},
 	{Version: 2, SQL: schemaV2},
 	{Version: 3, SQL: schemaV3},
+	{Version: 4, SQL: schemaV4},
 }
 
 // schemaV1 is the baseline: every table from the original unversioned bootstrap,
@@ -163,6 +164,24 @@ UPDATE webhook_delivery d SET subscription_id = s.id
 DELETE FROM webhook_delivery WHERE subscription_id IS NULL;
 ALTER TABLE webhook_delivery ALTER COLUMN subscription_id SET NOT NULL;
 CREATE INDEX IF NOT EXISTS webhook_delivery_sub_idx ON webhook_delivery (subscription_id, status);
+`
+
+// schemaV4 records what Telegram has said about an account: its Premium flag,
+// when it was found frozen, and the cooldowns its flood and spam errors
+// imposed. Cooldowns can last hours, so they live here rather than only in
+// the owning worker's memory, and survive the session moving hosts.
+const schemaV4 = `
+ALTER TABLE session
+  ADD COLUMN is_premium boolean,
+  ADD COLUMN frozen_at timestamptz;
+CREATE TABLE cooldown (
+  session_id uuid NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+  scope      text NOT NULL,
+  ends_at    timestamptz NOT NULL,
+  reason     text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (session_id, scope)
+);
 `
 
 // applyMigrations runs every migration newer than the recorded version, in

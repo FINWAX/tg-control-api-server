@@ -76,6 +76,8 @@ func New(st *store.Store, stale time.Duration, token string, uploads *upload.Sto
 	mux.HandleFunc("GET /v1/workers", rt.listWorkers)
 	mux.HandleFunc("GET /v1/user/{id}/sends", rt.getSend)
 	mux.HandleFunc("GET /v1/bot/{id}/sends", rt.getSend)
+	mux.HandleFunc("GET /v1/user/{id}/limits", rt.getLimits)
+	mux.HandleFunc("GET /v1/bot/{id}/limits", rt.getLimits)
 	mux.HandleFunc("GET /v1/user/{id}/updates/subscriptions", rt.listSubscriptions)
 	mux.HandleFunc("GET /v1/bot/{id}/updates/subscriptions", rt.listSubscriptions)
 	mux.HandleFunc("GET /v1/user/{id}/updates/subscriptions/{sub}", rt.getSubscription)
@@ -123,6 +125,9 @@ func New(st *store.Store, stale time.Duration, token string, uploads *upload.Sto
 	// any worker will, since the owner picks new subscriptions up by itself.
 	mux.HandleFunc("POST /v1/user/{id}/updates/subscriptions", rt.ownerOrAnyWorker)
 	mux.HandleFunc("POST /v1/bot/{id}/updates/subscriptions", rt.ownerOrAnyWorker)
+	// Lifting a cooldown must reach the live copy on the owner; master only.
+	mux.HandleFunc("DELETE /v1/user/{id}/limits/cooldowns/{scope}", rt.ownerOrAnyWorker)
+	mux.HandleFunc("DELETE /v1/bot/{id}/limits/cooldowns/{scope}", rt.ownerOrAnyWorker)
 
 	return rt.auth(mux)
 }
@@ -208,8 +213,8 @@ func (rt *Router) auth(next http.Handler) http.Handler {
 }
 
 // sessionTarget reports whether (method, path) is a route a scoped token may use
-// — a session's /call, status read, downloads, send resolution and its own
-// update subscriptions — and returns that session id. Everything else is
+// — a session's /call, status read, downloads, send resolution, limits and its
+// own update subscriptions — and returns that session id. Everything else is
 // master-only.
 func sessionTarget(method, path string) (string, bool) {
 	parts := strings.Split(strings.Trim(path, "/"), "/")
@@ -228,6 +233,9 @@ func sessionTarget(method, path string) (string, bool) {
 	}
 	if method == http.MethodGet && len(parts) == 4 && parts[3] == "sends" {
 		return id, true // GET /v1/{kind}/{id}/sends — resolve a temporary id
+	}
+	if method == http.MethodGet && len(parts) == 4 && parts[3] == "limits" {
+		return id, true // GET /v1/{kind}/{id}/limits — cooldowns, account flags
 	}
 	if len(parts) >= 5 && parts[3] == "updates" && parts[4] == "subscriptions" {
 		// The handlers narrow a scoped token to the subscriptions it owns.
@@ -329,6 +337,25 @@ func (rt *Router) getSend(w http.ResponseWriter, r *http.Request) {
 		out["error"] = json.RawMessage(rec.Error)
 	}
 	writeOK(w, out)
+}
+
+// getLimits reports what Telegram has said about a session's account and the
+// cooldowns the gateway holds it to. Served from the registry, so it answers
+// while the session is unhosted too.
+func (rt *Router) getLimits(w http.ResponseWriter, r *http.Request) {
+	if _, ok := rt.resolveSession(w, r); !ok {
+		return
+	}
+	l, found, err := rt.st.SessionLimits(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+	writeOK(w, l)
 }
 
 // --- update subscriptions ---

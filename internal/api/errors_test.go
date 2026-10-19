@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/FINWAX/tg-control-api-server/internal/session"
 	"github.com/FINWAX/tg-control-api-server/internal/tdjson"
 )
 
@@ -51,5 +53,33 @@ func TestWriteCallErrFloodWait(t *testing.T) {
 	}
 	if body.Error.RetryAfter != 61 || body.Error.Source != "tdlib" {
 		t.Errorf("error = %+v, want retry_after 61 from tdlib", body.Error)
+	}
+}
+
+func TestWriteCallErrRefused(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeCallErr(rec, &session.RefusedError{Reason: "cooldown", Scope: "@resolve",
+		Until: time.Now().Add(30 * time.Second), Cause: "Too Many Requests: retry after 3600"})
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") != "30" {
+		t.Errorf("status %d Retry-After %q, want 429 30", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	var body struct {
+		Error struct {
+			Source     string         `json:"source"`
+			Code       string         `json:"code"`
+			RetryAfter int            `json:"retry_after"`
+			Details    map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	e := body.Error
+	if e.Source != "gateway" || e.Code != "rate_limited" || e.RetryAfter != 30 {
+		t.Errorf("error = %+v", e)
+	}
+	if e.Details["source"] != "cooldown" || e.Details["scope"] != "@resolve" ||
+		e.Details["error"] != "Too Many Requests: retry after 3600" {
+		t.Errorf("details = %v", e.Details)
 	}
 }

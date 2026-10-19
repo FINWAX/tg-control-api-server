@@ -38,6 +38,8 @@ type liveSession struct {
 	subs    *subSnapshot // update subscriptions as last loaded; nil = none
 	dropped atomic.Int64 // updates lost before queueing, not yet recorded
 
+	g guard // cooldowns, write pace and account flags (see guard.go)
+
 	// Interactive login state. The client is stashed while the authorizer is
 	// still driving the login (so a resend can reach it), and loggingIn keeps
 	// everything that expects a usable account away from it until it is done.
@@ -94,6 +96,17 @@ func (m *Manager) updateHandler(ls *liveSession) client.ResultHandler {
 		if ctor := result.GetConstructor(); ctor == "updateMessageSendSucceeded" || ctor == "updateMessageSendFailed" {
 			m.finishUpload(result)
 			m.noteSendOutcome(ls.id, result)
+		}
+		switch u := result.(type) {
+		case *client.UpdateMessageSendFailed:
+			m.observeSendFailed(ls, u)
+		case *client.UpdateOption:
+			switch u.Name {
+			case "is_premium":
+				m.notePremium(ls, u.Value)
+			case "my_id":
+				ls.noteMyID(u.Value)
+			}
 		}
 		// A resend produces a new authenticationCodeInfo (different delivery
 		// type, fresh resend timeout) only on the update stream — the request
@@ -732,6 +745,7 @@ func (m *Manager) rehydrateOne(ctx context.Context, r store.Rehydratable) error 
 	// Before the client exists: updates flow from its first moment, and any
 	// that arrive before the subscriptions are known would be lost.
 	m.syncSubscriptions(ctx, []*liveSession{ls})
+	m.loadGuard(ctx, ls)
 
 	h := &authHandler{
 		params:    m.buildParams(r.DBDir, dbKey, app.APIID, string(apiHash)),
@@ -756,6 +770,7 @@ func (m *Manager) rehydrateOne(ctx context.Context, r store.Rehydratable) error 
 	}
 	m.clearRetry(r.ID)
 	ls.setClient(cl)
+	go m.readAccount(ls, cl)
 	return nil
 }
 
@@ -908,6 +923,7 @@ func (m *Manager) CreateUser(ctx context.Context, appID, phone, proxyID, label s
 			return
 		}
 		ls.setClient(cl)
+		m.readAccount(ls, cl)
 	}()
 
 	waitLeave(ls, "connecting", loginWait)
@@ -1019,6 +1035,8 @@ func IsBlockedMethod(method string) bool { return blockedMethods[method] }
 // just private chats (see forceLoadChat), so callers need not know the chat_id
 // encoding. Flood waits are not retried here: TDLib already sits out the short
 // ones (up to 60 s, which is how long a call may hang) and returns the rest.
+// The guard (guard.go) may refuse a call before it reaches Telegram, and
+// learns from how Telegram answered it.
 func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMessage) (json.RawMessage, error) {
 	ls := m.get(id)
 	if ls == nil {
@@ -1036,8 +1054,16 @@ func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMe
 		return nil, err
 	}
 
-	params, err = m.resolveChatUsername(ctx, cl, params)
+	// Cooldown first: a refused call should not spend a username resolve.
+	scope := methodScope(method)
+	if err := checkCooldown(ls, scope); err != nil {
+		return nil, err
+	}
+	params, err = m.resolveChatUsername(ctx, ls, cl, params)
 	if err != nil {
+		return nil, err
+	}
+	if err := m.admit(ctx, ls, cl, scope, params); err != nil {
 		return nil, err
 	}
 
@@ -1051,6 +1077,7 @@ func (m *Manager) Call(ctx context.Context, id, method string, params json.RawMe
 		}
 	}
 	logFloodWait(id, method, err)
+	m.observe(ls, scope, err)
 	if err == nil {
 		if len(uploadDirs) > 0 {
 			m.trackUpload(res, uploadDirs)
@@ -1077,7 +1104,7 @@ func logFloodWait(id, method string, err error) {
 // resolveChatUsername rewrites a string chat_id ("@name" or "name") to the
 // numeric id of the resolved public chat. A numeric chat_id passes through
 // untouched (no extra call).
-func (m *Manager) resolveChatUsername(ctx context.Context, cl *client.Client, params json.RawMessage) (json.RawMessage, error) {
+func (m *Manager) resolveChatUsername(ctx context.Context, ls *liveSession, cl *client.Client, params json.RawMessage) (json.RawMessage, error) {
 	uname, ok := stringChatID(params)
 	if !ok {
 		return params, nil
@@ -1086,8 +1113,15 @@ func (m *Manager) resolveChatUsername(ctx context.Context, cl *client.Client, pa
 	if uname == "" {
 		return params, nil
 	}
+	// A resolve is a searchPublicChat like any other, and Telegram limits those
+	// hard: it goes through the same cooldown.
+	if err := checkCooldown(ls, "@resolve"); err != nil {
+		return nil, err
+	}
 	q, _ := json.Marshal(map[string]any{"username": uname})
 	res, err := tdjson.Call(ctx, cl, "searchPublicChat", q)
+	logFloodWait(ls.id, "searchPublicChat", err)
+	m.observe(ls, "@resolve", err)
 	if err != nil {
 		return nil, fmt.Errorf("resolve @%s: %w", uname, err)
 	}
@@ -1318,12 +1352,18 @@ type SessionState struct {
 	Status    string          `json:"status"`
 	CodeInfo  json.RawMessage `json:"code_info,omitempty"`  // td_api authenticationCodeInfo
 	LastError string          `json:"last_error,omitempty"` // last refusal, verbatim
+	// What Telegram has said about the account (see guard.go).
+	IsPremium   *bool `json:"is_premium,omitempty"`
+	Frozen      bool  `json:"frozen"`
+	SpamLimited bool  `json:"spam_limited"`
 }
 
 func (s *liveSession) state() SessionState {
+	var st SessionState
+	st.IsPremium, st.Frozen, st.SpamLimited = s.g.flags(time.Now())
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := SessionState{Status: s.status}
+	st.Status = s.status
 	switch s.status {
 	case "awaiting_code":
 		st.CodeInfo = s.codeInfo

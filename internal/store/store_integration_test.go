@@ -865,3 +865,79 @@ func TestMigrationV3Backfill(t *testing.T) {
 		t.Fatalf("second subscription on one session refused: %v", err)
 	}
 }
+
+func TestSessionLimits(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	sid := mkAuthorizedSession(t, st, mkApp(t, st, "a"), "user", "/d/limits")
+
+	l, found, err := st.SessionLimits(ctx, sid)
+	if err != nil || !found {
+		t.Fatalf("SessionLimits: found %v err %v", found, err)
+	}
+	if l.IsPremium != nil || l.Frozen || l.SpamLimited || len(l.Cooldowns) != 0 {
+		t.Errorf("fresh session = %+v, want nothing known", l)
+	}
+
+	now := time.Now()
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(st.SetCooldown(ctx, sid, Cooldown{Scope: "@resolve", Until: now.Add(time.Hour), Reason: "long"}))
+	must(st.SetCooldown(ctx, sid, Cooldown{Scope: "@resolve", Until: now.Add(time.Minute), Reason: "short"}))
+	must(st.SetCooldown(ctx, sid, Cooldown{Scope: SpamLimitScope, Until: now.Add(24 * time.Hour), Reason: "PEER_FLOOD"}))
+	must(st.SetCooldown(ctx, sid, Cooldown{Scope: "@join", Until: now.Add(-time.Minute), Reason: "over"}))
+	must(st.SetSessionPremium(ctx, sid, true))
+	must(st.SetSessionFrozen(ctx, sid, true))
+
+	l, _, err = st.SessionLimits(ctx, sid)
+	must(err)
+	if l.IsPremium == nil || !*l.IsPremium || !l.Frozen || l.FrozenSince == nil || !l.SpamLimited {
+		t.Errorf("flags = %+v", l)
+	}
+	if len(l.Cooldowns) != 2 || l.Cooldowns[0].Scope != "@resolve" || l.Cooldowns[0].Reason != "long" {
+		t.Errorf("cooldowns = %+v, want @resolve (the longer one) then spam_limit", l.Cooldowns)
+	}
+
+	// The listing carries the same flags.
+	items, err := st.ListSessions(ctx)
+	must(err)
+	if len(items) != 1 || items[0].IsPremium == nil || !*items[0].IsPremium || !items[0].Frozen || !items[0].SpamLimited {
+		t.Errorf("listing = %+v", items)
+	}
+
+	// Freezing again keeps the first sighting; clearing drops it.
+	first := *l.FrozenSince
+	must(st.SetSessionFrozen(ctx, sid, true))
+	l, _, _ = st.SessionLimits(ctx, sid)
+	if !l.FrozenSince.Equal(first) {
+		t.Errorf("frozen_since moved: %v -> %v", first, l.FrozenSince)
+	}
+	must(st.SetSessionFrozen(ctx, sid, false))
+	l, _, _ = st.SessionLimits(ctx, sid)
+	if l.Frozen || l.FrozenSince != nil {
+		t.Errorf("unfrozen = %+v", l)
+	}
+
+	if found, err := st.DeleteCooldown(ctx, sid, "@resolve"); err != nil || !found {
+		t.Errorf("DeleteCooldown = %v, %v; want found", found, err)
+	}
+	if found, _ := st.DeleteCooldown(ctx, sid, "@resolve"); found {
+		t.Error("DeleteCooldown found a cooldown already lifted")
+	}
+	if n, err := st.PurgeCooldowns(ctx, now); err != nil || n != 1 {
+		t.Errorf("PurgeCooldowns = %d, %v; want the one ended", n, err)
+	}
+	if _, found, _ := st.SessionLimits(ctx, "00000000-0000-0000-0000-000000000000"); found {
+		t.Error("unknown session found")
+	}
+	if _, _, err := st.DeleteSession(ctx, sid); err != nil {
+		t.Fatal(err)
+	}
+	if n := countRows(t, st, `SELECT count(*) FROM cooldown`); n != 0 {
+		t.Errorf("cooldowns outlived their session: %d", n)
+	}
+}

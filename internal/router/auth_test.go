@@ -30,6 +30,8 @@ func TestSessionTarget(t *testing.T) {
 		{"POST", "/v1/bot/xyz/updates/subscriptions", "xyz", true},
 		{"GET", "/v1/user/abc/updates/subscriptions/s1", "abc", true},
 		{"DELETE", "/v1/bot/xyz/updates/subscriptions/s1", "xyz", true},
+		{"GET", "/v1/user/abc/limits", "abc", true},
+		{"GET", "/v1/bot/xyz/limits", "xyz", true},
 
 		// denied: management and lifecycle
 		{"POST", "/v1/user/abc", "", false},
@@ -55,6 +57,8 @@ func TestSessionTarget(t *testing.T) {
 		{"PUT", "/v1/user/abc/updates/subscriptions/s1", "", false},   // no updates in place
 		{"GET", "/v1/user/abc/updates/subscriptions/s1/x", "", false}, // nothing below one
 		{"GET", "/v1/user/abc/updates", "", false},
+		{"POST", "/v1/user/abc/limits", "", false},                        // read-only
+		{"DELETE", "/v1/user/abc/limits/cooldowns/spam_limit", "", false}, // master only
 	}
 	for _, c := range cases {
 		gotID, gotOK := sessionTarget(c.method, c.path)

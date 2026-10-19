@@ -54,6 +54,8 @@ func NewServer(st *store.Store, sec *secret.Box, mgr *session.Manager) http.Hand
 	mux.HandleFunc("DELETE /v1/bot/{id}", s.handleDeleteSession)
 	mux.HandleFunc("PATCH /v1/user/{id}", s.handleUpdateSession)
 	mux.HandleFunc("PATCH /v1/bot/{id}", s.handleUpdateSession)
+	mux.HandleFunc("DELETE /v1/user/{id}/limits/cooldowns/{scope}", s.handleClearCooldown)
+	mux.HandleFunc("DELETE /v1/bot/{id}/limits/cooldowns/{scope}", s.handleClearCooldown)
 
 	return mux
 }
@@ -84,6 +86,11 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 // A flood wait additionally carries the wait both as error.retry_after and as
 // the standard Retry-After header, so clients need not parse the message.
 func writeCallErr(w http.ResponseWriter, err error) {
+	var re *session.RefusedError
+	if errors.As(err, &re) {
+		writeRefused(w, re)
+		return
+	}
 	var te *tdjson.Error
 	if errors.As(err, &te) {
 		body := map[string]any{"code": te.Code, "message": te.Message, "source": "tdlib"}
@@ -97,6 +104,26 @@ func writeCallErr(w http.ResponseWriter, err error) {
 		return
 	}
 	writeErr(w, http.StatusBadGateway, err.Error())
+}
+
+// writeRefused renders a call the guard stopped before it reached Telegram,
+// in the shape VK-Control uses for the same refusal: a gateway 429 with code
+// "rate_limited", the wait, and details naming what stopped it.
+func writeRefused(w http.ResponseWriter, re *session.RefusedError) {
+	secs := max(re.RetryAfter(), 1)
+	details := map[string]any{
+		"source": re.Reason, "scope": re.Scope, "until": re.Until.UTC(), "retry_after": secs,
+	}
+	if re.Cause != "" {
+		details["error"] = re.Cause
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusTooManyRequests)
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": map[string]any{
+		"source": "gateway", "code": "rate_limited", "message": re.Error(),
+		"retry_after": secs, "details": details,
+	}})
 }
 
 // writeLoginErr renders a login failure. A code or password Telegram itself
@@ -470,6 +497,20 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeOK(w, map[string]any{"status": "deleted"})
+}
+
+// handleClearCooldown lifts one of a session's cooldowns (master token only).
+func (s *Server) handleClearCooldown(w http.ResponseWriter, r *http.Request) {
+	found, err := s.mgr.ClearCooldown(r.Context(), r.PathValue("id"), r.PathValue("scope"))
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "no such cooldown")
 		return
 	}
 	writeOK(w, map[string]any{"status": "deleted"})

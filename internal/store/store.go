@@ -285,6 +285,10 @@ type SessionInfo struct {
 	AppLabel   string     `json:"app_label,omitempty"`
 	ProxyID    string     `json:"proxy_id,omitempty"`
 	Proxy      string     `json:"proxy,omitempty"` // "socks5 host:port"
+	// What Telegram has said about the account; see SessionLimits.
+	IsPremium   *bool `json:"is_premium,omitempty"` // unknown until TDLib reports it
+	Frozen      bool  `json:"frozen"`
+	SpamLimited bool  `json:"spam_limited"`
 }
 
 // sessionListSQL is the shared projection behind the session listings; callers
@@ -292,7 +296,10 @@ type SessionInfo struct {
 const sessionListSQL = `SELECT s.id, s.kind, s.status, COALESCE(s.phone,''), COALESCE(s.label,''),
 	        COALESCE(s.worker_id,''), s.last_seen_at, s.created_at,
 	        s.app_id::text, COALESCE(a.label,''),
-	        COALESCE(s.proxy_id::text,''), p.type, p.host, p.port
+	        COALESCE(s.proxy_id::text,''), p.type, p.host, p.port,
+	        s.is_premium, s.frozen_at IS NOT NULL,
+	        EXISTS(SELECT 1 FROM cooldown c
+	               WHERE c.session_id = s.id AND c.scope = 'spam_limit' AND c.ends_at > now())
 	 FROM session s
 	 LEFT JOIN tg_app a ON a.id = s.app_id
 	 LEFT JOIN proxy  p ON p.id = s.proxy_id`
@@ -332,7 +339,8 @@ func (s *Store) querySessions(ctx context.Context, sql string, args ...any) ([]S
 		if err := rows.Scan(&si.ID, &si.Kind, &si.Status, &si.Phone, &si.Label,
 			&si.WorkerID, &si.LastSeenAt, &si.CreatedAt,
 			&si.AppID, &si.AppLabel,
-			&si.ProxyID, &ptype, &phost, &pport); err != nil {
+			&si.ProxyID, &ptype, &phost, &pport,
+			&si.IsPremium, &si.Frozen, &si.SpamLimited); err != nil {
 			return nil, err
 		}
 		if ptype != nil && phost != nil && pport != nil {
@@ -1195,4 +1203,106 @@ func (s *Store) PurgeSends(ctx context.Context, before time.Time) (int64, error)
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
+}
+
+// --- account limits ---
+
+// SpamLimitScope is the cooldown Telegram's PEER_FLOOD imposes: the account
+// may only write to mutual contacts, invite nobody and import no contacts.
+const SpamLimitScope = "spam_limit"
+
+// Cooldown is a scope of calls the gateway refuses on a session until a time,
+// because Telegram asked it to wait or restricted the account. The scope is a
+// method group ("@send"), a method name, or SpamLimitScope; the reason is
+// Telegram's own error text.
+type Cooldown struct {
+	Scope  string    `json:"scope"`
+	Until  time.Time `json:"until"`
+	Reason string    `json:"reason"`
+}
+
+// Limits is what Telegram has said about a session's account.
+type Limits struct {
+	IsPremium   *bool      `json:"is_premium,omitempty"`
+	Frozen      bool       `json:"frozen"`
+	FrozenSince *time.Time `json:"frozen_since,omitempty"`
+	SpamLimited bool       `json:"spam_limited"`
+	Cooldowns   []Cooldown `json:"cooldowns"` // active ones, soonest to end first
+}
+
+// SessionLimits returns a session's account state and active cooldowns, or
+// found=false for an unknown session.
+func (s *Store) SessionLimits(ctx context.Context, id string) (l Limits, found bool, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT is_premium, frozen_at FROM session WHERE id=$1`, id).Scan(&l.IsPremium, &l.FrozenSince)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return l, false, nil
+	}
+	if err != nil {
+		return l, false, err
+	}
+	l.Frozen = l.FrozenSince != nil
+	rows, err := s.pool.Query(ctx,
+		`SELECT scope, ends_at, reason FROM cooldown
+		 WHERE session_id=$1 AND ends_at > now() ORDER BY ends_at`, id)
+	if err != nil {
+		return l, false, err
+	}
+	defer rows.Close()
+	l.Cooldowns = []Cooldown{}
+	for rows.Next() {
+		var c Cooldown
+		if err := rows.Scan(&c.Scope, &c.Until, &c.Reason); err != nil {
+			return l, false, err
+		}
+		l.SpamLimited = l.SpamLimited || c.Scope == SpamLimitScope
+		l.Cooldowns = append(l.Cooldowns, c)
+	}
+	return l, true, rows.Err()
+}
+
+// SetCooldown records a cooldown, keeping the later end if one is already
+// running on that scope.
+func (s *Store) SetCooldown(ctx context.Context, sessionID string, c Cooldown) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO cooldown (session_id, scope, ends_at, reason) VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (session_id, scope) DO UPDATE
+		   SET ends_at = excluded.ends_at, reason = excluded.reason, created_at = now()
+		   WHERE cooldown.ends_at < excluded.ends_at`,
+		sessionID, c.Scope, c.Until, c.Reason)
+	return err
+}
+
+// PurgeCooldowns removes cooldowns that ended before the cutoff.
+func (s *Store) PurgeCooldowns(ctx context.Context, before time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM cooldown WHERE ends_at < $1`, before)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// SetSessionPremium records the account's Premium flag.
+func (s *Store) SetSessionPremium(ctx context.Context, id string, premium bool) error {
+	_, err := s.pool.Exec(ctx, `UPDATE session SET is_premium=$2 WHERE id=$1`, id, premium)
+	return err
+}
+
+// SetSessionFrozen marks the account frozen (keeping when that was first
+// seen) or clears the mark.
+func (s *Store) SetSessionFrozen(ctx context.Context, id string, frozen bool) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE session SET frozen_at = CASE WHEN $2 THEN COALESCE(frozen_at, now()) END WHERE id=$1`,
+		id, frozen)
+	return err
+}
+
+// DeleteCooldown lifts a cooldown, reporting whether one was recorded.
+func (s *Store) DeleteCooldown(ctx context.Context, sessionID, scope string) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM cooldown WHERE session_id=$1 AND scope=$2`, sessionID, scope)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }

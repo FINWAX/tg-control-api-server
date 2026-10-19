@@ -81,6 +81,11 @@ func (m *Manager) purgeOnce() {
 	} else if n > 0 {
 		log.Printf("retention: purged %d send records", n)
 	}
+	if n, err := m.st.PurgeCooldowns(ctx, time.Now()); err != nil {
+		log.Printf("retention: cooldowns: %v", err)
+	} else if n > 0 {
+		log.Printf("retention: purged %d ended cooldowns", n)
+	}
 	m.sweepUploads()
 }
 
