@@ -65,8 +65,10 @@ API и шифруются в БД; в .env только инфра-конфиг 
   краулинга; вход по локальному file_id или постоянному remote_id.
 - `GET /v1/{user|bot}/{id}` -> {id, status, code_info?, last_error?, is_premium?,
   frozen, spam_limited}
-- `GET /v1/{user|bot}/{id}/limits` -> {is_premium?, frozen, spam_limited, cooldowns};
-  `DELETE .../limits/cooldowns/{scope}` - снять охлаждение (мастер)
+- `GET /v1/{user|bot}/{id}/limits` -> {is_premium?, frozen, spam_limited, cooldowns,
+  rules}; `DELETE .../limits/cooldowns/{scope}` - снять охлаждение (мастер);
+  `GET /v1/me/limits` - всё по сессиям scoped-токена
+- `POST/GET /v1/limits`, `GET/PATCH/DELETE /v1/limits/{id}` - квоты (мастер)
 
 Логин-флоу восстановим: неверный код/пароль не рушит сессию (возвращается ошибка
 tdlib, статус остаётся awaiting_*), awaiting_* пишутся в реестр - вернуться в
@@ -99,6 +101,11 @@ FROZEN_* - флаг frozen. Пишущие группы - темп ~1/с на с
 отказ. Отказ шлюза - 429 source:gateway code:rate_limited + details. Охлаждения -
 в памяти воркера и в таблице cooldown (переживают переезд сессии). TDLib сам
 пережидает флуд до 60 с, поэтому /call может отвечать до минуты.
+Квоты (internal/quota - политика, session/limits.go - учёт, router/limits.go -
+CRUD) - модель VK-Control без уровней app/proxy и окна second: правило сессии,
+по умолчанию для kind, токена; замена по подписи (per+methods); счётчики в
+Postgres на сессию (rate_counter), всё-или-ничего в одной транзакции; воркер
+перечитывает правила раз в 2 с; при недоступной БД - пропускает.
 
 Прокси на сессию поддерживается (addProxy), в локальном случае опционален; смысл -
 чтобы каждый из <50 аккаунтов мог ходить со своего IP. Схема БД версионируется

@@ -236,6 +236,8 @@ Every request except `GET /healthz` must carry `Authorization: Bearer <token>`.
 | `GET  /v1/{user\|bot}/{id}` | Session state → `{id, status, code_info?, last_error?, is_premium?, frozen, spam_limited}` |
 | `GET /v1/{user\|bot}/{id}/limits` | Account flags and active cooldowns (see [Limits and cooldowns](#limits-and-cooldowns)) |
 | `DELETE /v1/{user\|bot}/{id}/limits/cooldowns/{scope}` | Lift a cooldown early (master only) |
+| `GET /v1/me/limits` | A scoped token's limits on all its sessions |
+| `POST/GET /v1/limits`, `GET/PATCH/DELETE /v1/limits/{id}` | Quota rules (see [Quotas](#quotas)) |
 | `PATCH /v1/{user\|bot}/{id}` `{label?, proxy_id?}` | Rename / change proxy (applied live) |
 | `DELETE /v1/{user\|bot}/{id}` | Close and remove a session |
 | `GET  /v1/{sessions\|apps\|proxies\|workers}` | Registry listings (no secrets) |
@@ -633,10 +635,11 @@ has a gap.
 ## Limits and cooldowns
 
 Telegram restricts an account for how it behaves as a whole, and a session
-may serve several consumers at once. The gateway therefore holds every user
-session to what Telegram has signalled, across all its consumers. Nothing
-here guesses Telegram's numbers; bots are not held back, since their limits
-are per chat and a flood costs them only the wait.
+may serve several consumers at once. The gateway therefore holds every session
+back on behalf of all its consumers, in three ways. Cooldowns and pace act on
+what Telegram has signalled and need no setup; they apply to user sessions
+only, since a bot's limits are per chat and a flood costs it only the wait.
+Quotas are the operator's own ceilings and apply to any session.
 
 - **Cooldowns.** When Telegram makes a call wait longer than TDLib sits out
   (the `429` with `retry_after`), the method's group cools down on that
@@ -649,6 +652,8 @@ are per chat and a flood costs them only the wait.
 - **Pace.** Writes (`@send`, `@join`, `@invite`, `@create`, `@contacts`) leave a
   session at most about once a second, whoever sends them; a write waits for its
   turn, and one that would wait over 10 seconds is refused at once.
+- **Quotas.** Rules the operator sets: at most so many calls of some methods per
+  minute, hour, day or week (see [Quotas](#quotas)). None exist until created.
 
 A call stopped this way never reaches Telegram:
 
@@ -658,13 +663,16 @@ A call stopped this way never reaches Telegram:
   "source": "gateway", "code": "rate_limited", "retry_after": 3540,
   "message": "@resolve is cooling down: Too Many Requests: retry after 3600",
   "details": {
-    "source": "cooldown",       // or "pace"
-    "scope": "@resolve",        // method group, method name, or "spam_limit"
+    "source": "cooldown",       // "cooldown", "pace" or "limit"
+    "scope": "@resolve",        // cooldown and pace: method group, method name, or "spam_limit"
     "until": "2026-10-19T17:00:00Z",
     "retry_after": 3540,
-    "error": "Too Many Requests: retry after 3600"  // Telegram's signal; not on pace
+    "error": "Too Many Requests: retry after 3600"  // cooldown only: Telegram's signal
+    // limit only: "level": "session" | "token", "limit_id": "<rule id>"
   }}}
 ```
+
+A call refused for any of these spends no quota.
 
 Method groups:
 
@@ -690,14 +698,62 @@ read it for their own sessions:
  "frozen": false,            // Telegram answered a call with FROZEN_*: read-only account
  "frozen_since": "...",      // when that was first seen
  "spam_limited": true,       // a spam_limit cooldown is running
- "cooldowns": [{"scope": "spam_limit", "until": "...", "reason": "PEER_FLOOD"}]}
+ "cooldowns": [{"scope": "spam_limit", "until": "...", "reason": "PEER_FLOOD"}],
+ "rules": [{"id": "...", "level": "session", "kind": "user", "methods": ["@join"],
+            "max": 10, "per": "day", "enabled": true,
+            "usage": {"used": 4, "window_end": "2026-10-20T21:00:00Z"},
+            "replaced_by": "..."}]}   // set when another rule takes its place here
 ```
+
+`GET /v1/me/limits` gives a scoped token the same for every session it may use,
+in one call: `{"sessions": [{<session listing fields>, "cooldowns", "rules"}]}`.
 
 The same `is_premium`, `frozen` and `spam_limited` appear in `GET /v1/sessions`
 and in the session state. `frozen` clears itself once a write goes through. A
 `spam_limit` ends after 24 hours; if Telegram lifts the restriction earlier
 (after an appeal to @SpamBot), lift it here with
 `DELETE /v1/{user|bot}/{id}/limits/cooldowns/spam_limit` (master token).
+
+### Quotas
+
+The same model as VK-Control. A rule caps `max` calls of `methods` per `per`:
+
+```bash
+curl -X POST localhost:8080/v1/limits -H "Authorization: Bearer $API_TOKEN" \
+  -d '{"level":"session","kind":"user","methods":["@join"],"max":10,"per":"day","label":"joins"}'
+```
+
+| Field | Meaning |
+|---|---|
+| `level` | `session` or `token` |
+| `kind` | with `level: session` and no `session_id`: the default for every `user` or `bot` session |
+| `session_id` | with `level: session`: that session's own rule |
+| `token_id` | with `level: token`: that consumer token's rule, on each session it calls |
+| `methods` | `"*"` (every call), a method group (`"@send"`), or a td_api method name |
+| `max`, `per` | at most `max` calls per `minute`, `hour`, `day` or `week` |
+| `label`, `enabled` | optional; a disabled rule counts nothing |
+
+- **Every rule counts per session**: a default or token rule gives each session
+  its own allowance.
+- **Replacement**: a session's own rule takes the place of the default with the
+  same `per` and `methods`; a token's rule takes the place of both for that
+  token's calls. Rules with different `per` or `methods` all apply together, so
+  "3 per hour" and "10 per day" stack.
+- **Windows** are fixed: minutes and hours by the UTC clock, days from midnight
+  in Moscow, weeks from Monday.
+- **Weight**: a call counts once, except that `forwardMessages` and
+  `sendMessageAlbum` count their messages, `addChatMembers` its users and
+  `importContacts` its contacts (a `"*"` rule counts calls). A read with
+  `only_local: true` never reaches Telegram and counts nothing.
+- A call is checked against every rule bearing on it and counted in all of them
+  or none. A refused call, for any reason, spends nothing.
+- Workers re-read the rules every 2 seconds. If the database is unreachable,
+  calls go through: quotas must not stop the gateway.
+
+`POST/GET /v1/limits`, `GET/PATCH/DELETE /v1/limits/{id}` are master-only;
+`PATCH` changes `methods`, `max`, `per`, `label` and `enabled`, never the level or
+target. Each rule is shown with `usage`: in its current window, the most any one
+session has counted.
 
 ## API tokens
 
